@@ -34,6 +34,40 @@ from agentd.protocol import parse_stdout_line
 log = logging.getLogger("agentd.supervisor")
 
 
+def task_grant(
+    session_id: str,
+    profile_name: str,
+    profile: Profile,
+    workspace: Path | None,
+    room: RoomRef | None,
+    requester: str,
+    expires_at: str,
+) -> dict:
+    """The immutable authority a session runs under (docs#8). Fixed at spawn from the
+    server-side profile and the authenticated requester; nothing a worker reads later
+    (room messages, notes, artifacts, issue text) can widen it. Workers must derive every
+    permission from this, and there is no approval channel: anything not granted is denied."""
+    extra = profile.model_extra or {}
+    return {
+        "session_id": session_id,
+        "requester": requester,
+        "profile": profile_name,
+        "workspace": (
+            {"path": str(workspace), "mode": profile.workspace_mount} if workspace else None
+        ),
+        "network": profile.network,
+        "external_actions": profile.external_actions,
+        "approval": "none",
+        "expires_at": expires_at,
+        "max_budget_usd": extra.get("max_budget_usd"),
+        "room": (
+            {"room_url": room.room_url, "reply": extra.get("room_reply", True) is not False}
+            if room
+            else None
+        ),
+    }
+
+
 class SpawnError(Exception):
     def __init__(self, status_code: int, detail: str):
         super().__init__(detail)
@@ -117,6 +151,8 @@ class Supervisor:
         artifacts_dir: Path,
         workspace: Path | None,
         room: RoomRef | None,
+        requester: str,
+        expires_at: str,
     ) -> dict[str, str]:
         env = {k: os.environ[k] for k in self.settings.env_allowlist if k in os.environ}
         env.update(worker_env)
@@ -126,6 +162,11 @@ class Supervisor:
             AGENTD_PROFILE_NAME=profile_name,
             AGENTD_PROFILE=profile.model_dump_json(),
             AGENTD_ARTIFACTS_DIR=str(artifacts_dir),
+            AGENTD_GRANT=json.dumps(
+                task_grant(
+                    session_id, profile_name, profile, workspace, room, requester, expires_at
+                )
+            ),
         )
         if workspace:
             env.update(
@@ -195,6 +236,7 @@ class Supervisor:
         (session_dir / "input.json").write_text(json.dumps(redacted, indent=2))
 
         now = now_iso()
+        expires_at = iso_in(hard)
         with self.conn:
             self.conn.execute(
                 "insert into sessions (id, instance_id, requester_agent, requester_surface,"
@@ -217,14 +259,22 @@ class Supervisor:
                     idle,
                     now,
                     now,
-                    iso_in(hard),
+                    expires_at,
                     json.dumps(req.metadata) if req.metadata is not None else None,
                 ),
             )
         self.events.append(session_id, "status", status="starting")
 
         env = self._worker_env(
-            session_id, req.profile, profile, worker.env, artifacts_dir, workspace, room
+            session_id,
+            req.profile,
+            profile,
+            worker.env,
+            artifacts_dir,
+            workspace,
+            room,
+            requester_agent,
+            expires_at,
         )
         try:
             handle = await self.backend.start(worker.command, env, workspace or scratch_dir)

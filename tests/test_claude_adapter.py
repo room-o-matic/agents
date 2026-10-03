@@ -208,7 +208,9 @@ def test_message_during_turn_joins_conversation(claude_client, boostie):
     assert r.status_code == 200
     s = wait_status(claude_client, sid, boostie)
     assert s["status"] == "completed"
-    assert s["summary"] == "done: slow + [message from boostie@test] also check CI"
+    assert s["summary"] == (
+        'done: slow + <owner-message from="boostie@test">\nalso check CI\n</owner-message>'
+    )
 
 
 def test_stop_mid_turn_is_prompt(claude_client, boostie):
@@ -230,4 +232,4 @@ def test_interactive_turns_then_stop_completes(claude_client, boostie):
     )
     s = claude_client.post(f"/v1/sessions/{sid}/stop", headers=boostie).json()
     assert s["status"] == "completed"
-    assert s["summary"] == "done: [message from boostie@test] second"
+    assert s["summary"] == 'done: <owner-message from="boostie@test">\nsecond\n</owner-message>'

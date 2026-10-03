@@ -1,7 +1,7 @@
 """Stand-in for `claude -p --input-format stream-json --output-format stream-json`.
 
 Emits the same message shapes as Claude Code (system init, assistant text and tool_use
-blocks, result). Behaviour is chosen by words in each user turn:
+blocks, result). Behaviour is chosen by whole words in each user turn:
 
     write-artifact  write report.md into AGENTD_ARTIFACTS_DIR
     fail-turn       end the turn with an error result
@@ -14,10 +14,16 @@ Writes its argv to $FAKE_CLAUDE_ARGV_FILE when set, so tests can check the flags
 
 import json
 import os
+import re
 import sys
 import time
 
 SESSION = "11111111-2222-3333-4444-555555555555"
+
+
+def has(text: str, word: str) -> bool:
+    """Whole-word keyword match, so e.g. "change" doesn't trigger "hang"."""
+    return re.search(rf"(?<![\w-]){re.escape(word)}(?![\w-])", text) is not None
 
 
 def out(obj: dict) -> None:
@@ -64,13 +70,13 @@ def main() -> int:
             }
         )
         print("not json at all", flush=True)  # the adapter must tolerate stray lines
-        if "die" in text:
+        if has(text, "die"):
             return 3
-        if "hang" in text:
+        if has(text, "hang"):
             time.sleep(3600)
-        if "slow" in text:
+        if has(text, "slow"):
             text += " + " + next(pending)
-        if "write-artifact" in text:
+        if has(text, "write-artifact"):
             with open(os.path.join(os.environ["AGENTD_ARTIFACTS_DIR"], "report.md"), "w") as f:
                 f.write("# Report\n")
             out(
@@ -88,7 +94,7 @@ def main() -> int:
                     },
                 }
             )
-        if "fail-turn" in text:
+        if has(text, "fail-turn"):
             out(
                 {
                     "type": "result",
