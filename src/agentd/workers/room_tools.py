@@ -160,6 +160,8 @@ class RoomTools:
         topic: str | None = None,
         confidence: float | None = None,
         reply_requested: bool | None = None,
+        to: list[str] | None = None,
+        in_reply_to: int | None = None,
     ) -> dict:
         """Post a message to the room. Use typed messages for important claims (proposal,
         objection, finding, question, answer, status) and include confidence for uncertain
@@ -173,6 +175,8 @@ class RoomTools:
             "topic": topic,
             "confidence": confidence,
             "reply_requested": reply_requested,
+            "to": to,  # structured recipients: who should consider replying (docs#16)
+            "in_reply_to": in_reply_to,  # the message you're answering
         }
         m = self._call(
             "POST",

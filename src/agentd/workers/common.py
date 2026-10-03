@@ -56,3 +56,14 @@ def announce_in_room(what: str = "started") -> str | None:
     except OSError as e:
         emit("error", message=f"could not join room {room}: {e}")
     return room
+
+
+def post_room_status(body: str) -> None:
+    """Best-effort status message to the worker's room (e.g. a limit being hit)."""
+    room = os.environ.get("ROOMSD_ROOM_ID")
+    if not room or not os.environ.get("ROOMSD_URL"):
+        return
+    try:
+        _roomsd("POST", f"/v1/rooms/{room}/messages", {"type": "status", "body": body})
+    except OSError as e:
+        emit("error", message=f"could not post to room {room}: {e}")
