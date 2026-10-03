@@ -24,11 +24,17 @@ create table if not exists sessions (
   stopped_at text,
   stop_reason text,
   summary text,
-  metadata_json text
+  metadata_json text,
+  -- docs#13: caller-scoped idempotency. Retrying a spawn with the same operation_id
+  -- returns the original session instead of starting a second worker.
+  operation_id text,
+  payload_hash text
 );
 
 create index if not exists sessions_status on sessions(status);
 create index if not exists sessions_requester on sessions(requester_agent, created_at);
+create unique index if not exists sessions_operation
+  on sessions(requester_agent, operation_id) where operation_id is not null;
 
 create table if not exists events (
   id integer primary key autoincrement,

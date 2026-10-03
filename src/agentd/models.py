@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 from typing import Literal
 
@@ -47,6 +49,19 @@ class SpawnRequest(BaseModel):
     parent_session_id: str | None = None
     room: RoomRef | None = None
     metadata: dict[str, JsonValue] | None = None
+    operation_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_.:-]{8,120}$",
+        description="idempotency key: retrying with it returns the original session",
+    )
+
+    def payload_hash(self) -> str:
+        """What a retry must match. The room token is a credential and may be re-minted,
+        so it isn't part of the identity of the request."""
+        body = self.model_dump(mode="json", exclude={"operation_id"})
+        if body.get("room"):
+            body["room"].pop("token", None)
+        return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
 class SpawnResponse(BaseModel):
@@ -54,6 +69,8 @@ class SpawnResponse(BaseModel):
     instance_id: str
     status: SessionStatus
     events_url: str
+    operation_id: str | None = None
+    replayed: bool = Field(default=False, description="true when an earlier request created it")
 
 
 class Session(BaseModel):

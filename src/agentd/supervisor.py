@@ -75,6 +75,14 @@ def task_grant(
     }
 
 
+class SpawnReplay(Exception):  # noqa: N818 - control flow, not an error
+    """The spawn is a retry of an earlier operation; carries the original session row."""
+
+    def __init__(self, row: sqlite3.Row):
+        super().__init__(row["id"])
+        self.row = row
+
+
 class SpawnError(Exception):
     def __init__(self, status_code: int, detail: str):
         super().__init__(detail)
@@ -210,7 +218,24 @@ class Supervisor:
             )
         return env
 
+    def by_operation(self, requester_agent: str, operation_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "select * from sessions where requester_agent = ? and operation_id = ?",
+            (requester_agent, operation_id),
+        ).fetchone()
+
     async def spawn(self, req: SpawnRequest, requester_agent: str) -> sqlite3.Row:
+        """Start a session, or with an operation_id seen before, return that session
+        (docs#13). Check and insert happen with no await in between, so concurrent
+        duplicates can't both start a worker."""
+        if req.operation_id:
+            existing = self.by_operation(requester_agent, req.operation_id)
+            if existing is not None:
+                if existing["payload_hash"] != req.payload_hash():
+                    raise SpawnError(
+                        409, "operation_id was already used for a different spawn request"
+                    )
+                raise SpawnReplay(existing)
         s = self.settings
         profile = s.profiles.get(req.profile)
         if profile is None:
@@ -298,8 +323,8 @@ class Supervisor:
                 "insert into sessions (id, instance_id, requester_agent, requester_surface,"
                 " requester_conversation_id, parent_session_id, profile, worker_type, status,"
                 " task, workspace_path, room_url, idle_timeout_seconds, created_at,"
-                " last_activity_at, expires_at, metadata_json)"
-                " values (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)",
+                " last_activity_at, expires_at, metadata_json, operation_id, payload_hash)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     s.instance_id,
@@ -317,6 +342,8 @@ class Supervisor:
                     now,
                     expires_at,
                     json.dumps(req.metadata) if req.metadata is not None else None,
+                    req.operation_id,
+                    req.payload_hash() if req.operation_id else None,
                 ),
             )
         self.events.append(session_id, "status", status="starting")

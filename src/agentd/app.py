@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -24,7 +24,7 @@ from agentd.models import (
     SpawnResponse,
     StopRequest,
 )
-from agentd.supervisor import SpawnError, Supervisor
+from agentd.supervisor import SpawnError, SpawnReplay, Supervisor
 from agentd.verify import InvalidToken, TokenVerifier
 
 log = logging.getLogger("agentd")
@@ -163,10 +163,16 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         )
 
     @app.post("/v1/sessions", status_code=status.HTTP_201_CREATED)
-    async def spawn(req: SpawnRequest, request: Request, agent: Agent) -> SpawnResponse:
+    async def spawn(
+        req: SpawnRequest, request: Request, response: Response, agent: Agent
+    ) -> SpawnResponse:
         assert_identity(agent, req.requester.agent)
+        replayed = False
         try:
             row = await sup(request).spawn(req, agent)
+        except SpawnReplay as r:
+            row, replayed = r.row, True
+            response.status_code = status.HTTP_200_OK
         except SpawnError as e:
             raise HTTPException(e.status_code, e.detail) from e
         return SpawnResponse(
@@ -174,7 +180,18 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
             instance_id=row["instance_id"],
             status=row["status"],
             events_url=events_url(row["id"]),
+            operation_id=row["operation_id"],
+            replayed=replayed,
         )
+
+    @app.get("/v1/sessions/by-operation/{operation_id}")
+    async def session_by_operation(operation_id: str, request: Request, agent: Agent) -> Session:
+        """Reconcile an ambiguous spawn: did the request with this operation_id start a
+        session? 404 means this gateway has no record of it (docs#13)."""
+        row = sup(request).by_operation(agent, operation_id)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no session for that operation_id")
+        return session_from_row(row)
 
     @app.get("/v1/sessions")
     async def list_sessions(
