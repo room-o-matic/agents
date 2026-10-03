@@ -1,0 +1,137 @@
+"""Fake worker for milestone 1 and tests. Behaviour is picked by the task's first word:
+
+    interactive  stay up, echo each message; finish on message "done"
+    hang         never emit an event (exercises the ready timeout)
+    crash        emit progress, then exit 3 without final
+    linger       emit final but don't exit (exercises reaping after final)
+    stubborn     ignore stop requests and SIGTERM (exercises SIGKILL)
+    chatty N     print N plain log lines, then final
+    badjson      emit malformed and reserved events, then final
+    escape       emit an artifact whose path escapes the artifacts dir, then final
+    (anything)   progress, a log line, an artifact, final
+
+If ROOMSD_* env vars are set, it joins the room and posts a status message first, the
+way a real worker announces itself.
+"""
+
+import json
+import os
+import signal
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+
+def emit(type: str, **fields) -> None:
+    print("AGENT_EVENT " + json.dumps({"type": type, **fields}), flush=True)
+
+
+def read_msg() -> dict | None:
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+
+def roomsd(method: str, path: str, body: dict | None = None) -> None:
+    req = urllib.request.Request(
+        os.environ["ROOMSD_URL"] + path,
+        method=method,
+        data=json.dumps(body or {}).encode(),
+        headers={
+            "Authorization": f"Bearer {os.environ['ROOMSD_TOKEN']}",
+            "Content-Type": "application/json",
+        },
+    )
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+def announce_in_room() -> None:
+    room = os.environ.get("ROOMSD_ROOM_ID")
+    if not room or not os.environ.get("ROOMSD_URL"):
+        return
+    try:
+        roomsd("POST", f"/v1/rooms/{room}/participants")
+        roomsd(
+            "POST",
+            f"/v1/rooms/{room}/messages",
+            {
+                "type": "status",
+                "body": f"session {os.environ['AGENTD_SESSION_ID']} on "
+                f"{os.environ['AGENTD_INSTANCE_ID']} started",
+            },
+        )
+        emit("progress", message=f"joined room {room}")
+    except OSError as e:
+        emit("error", message=f"could not join room {room}: {e}")
+
+
+def write_artifact(name: str, text: str) -> None:
+    Path(os.environ["AGENTD_ARTIFACTS_DIR"], name).write_text(text)
+    emit("artifact", name=name, path=name, mime_type="text/markdown")
+
+
+def main() -> int:
+    first = read_msg()
+    if not first or first.get("type") != "task":
+        print("expected a task message first", file=sys.stderr)
+        return 2
+    task: str = first["task"]
+    mode, _, arg = task.partition(" ")
+
+    if mode == "hang":
+        time.sleep(3600)
+        return 0
+    if mode == "stubborn":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        emit("progress", message="not stopping")
+        while True:
+            read_msg() or time.sleep(3600)
+
+    announce_in_room()
+
+    if mode == "crash":
+        emit("progress", message="about to crash")
+        return 3
+    if mode == "linger":
+        emit("final", summary="done, but not exiting")
+        time.sleep(3600)
+        return 0
+    if mode == "chatty":
+        emit("progress", message="chatting")
+        for i in range(int(arg or 10)):
+            print(f"line {i} " + "x" * 100, flush=True)
+        emit("final", summary="chatted")
+        return 0
+    if mode == "badjson":
+        print("AGENT_EVENT {not json", flush=True)
+        emit("status", status="completed")  # reserved for the gateway
+        emit("final", summary="survived bad output")
+        return 0
+    if mode == "escape":
+        emit("artifact", name="passwd", path="../../../etc/passwd")
+        emit("final", summary="tried to escape")
+        return 0
+    if mode == "interactive":
+        emit("progress", message="waiting for messages")
+        while (msg := read_msg()) is not None:
+            if msg["type"] == "stop":
+                emit("progress", message=f"stopping: {msg.get('reason')}")
+                return 0
+            if msg["type"] == "message":
+                if msg["message"] == "done":
+                    write_artifact("transcript.md", "# Transcript\n")
+                    emit("final", summary="finished on request")
+                    return 0
+                emit("progress", message=f"echo from {msg['sender']}: {msg['message']}")
+        return 0
+
+    emit("progress", message=f"working on: {task}")
+    print("hello from the fake worker", flush=True)
+    print("a stderr line", file=sys.stderr, flush=True)
+    write_artifact("notes.md", f"# Notes\n\nTask: {task}\n")
+    emit("final", summary=f"did: {task}", artifacts=["notes.md"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
