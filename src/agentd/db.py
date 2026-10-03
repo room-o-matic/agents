@@ -28,7 +28,12 @@ create table if not exists sessions (
   -- docs#13: caller-scoped idempotency. Retrying a spawn with the same operation_id
   -- returns the original session instead of starting a second worker.
   operation_id text,
-  payload_hash text
+  payload_hash text,
+  -- docs#17: room finalization, tracked separately from the session's terminal status.
+  room_invite_id text,
+  room_finalization text,
+  room_finalization_error text,
+  room_finalization_attempts integer not null default 0
 );
 
 create index if not exists sessions_status on sessions(status);

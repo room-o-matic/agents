@@ -130,6 +130,10 @@ class Settings(BaseModel):
     # Bounds on gateway -> worker stdin, so a worker that stops reading can't block
     # messages, stop requests or cleanup (docs#3).
     send_timeout_seconds: float = 5
+    # docs#17: room close-out retries (exponential from this base) before handing the
+    # invite to its owner.
+    finalize_retry_seconds: float = 2
+    finalize_max_attempts: int = 4
     max_pending_stdin_bytes: int = 1024 * 1024
     cleanup_interval_seconds: float = 30
     max_line_bytes: int = 64 * 1024

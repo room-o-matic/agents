@@ -19,6 +19,8 @@ class FakeRoomsd:
         self.notes: dict[str, dict] = {}
         self.participants: set[str] = set()
         self.revoked: set[str] = set()
+        self.revoke_status = 204  # docs#17 fault injection
+        self.post_status: int | None = None
         self.lock = threading.Lock()
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -74,6 +76,8 @@ class FakeRoomsd:
                 if p == "/v1/auth/whoami":
                     return self._reply(200, {"agent": who})
                 if p == "/v1/auth/revoke" and method == "POST":
+                    if fake.revoke_status != 204:
+                        return self._reply(fake.revoke_status, {"detail": "injected"})
                     token = self.headers["authorization"].removeprefix("Bearer ")
                     fake.revoked.add(token)
                     return self._reply(204)
@@ -81,6 +85,8 @@ class FakeRoomsd:
                     fake.participants.add(who)
                     return self._reply(200, {"agent": who})
                 if p == f"{room}/messages" and method == "POST":
+                    if fake.post_status is not None:
+                        return self._reply(fake.post_status, {"detail": "injected"})
                     b = self._body()
                     m = fake.post(who, b["body"], b.get("type", "message"))
                     m.update({k: b[k] for k in ("topic", "confidence") if k in b})

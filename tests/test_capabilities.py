@@ -47,3 +47,8 @@ def test_allowed_for_you_reflects_the_callers_grant(settings, lobby):
         # untrusted on the process backend: nothing is allowed, and the client can tell
         assert caps(c, lobby.headers("mallory"))["allowed_for_you"] == []
         assert caps(c, lobby.headers("nobody"))["allowed_for_you"] == []
+
+
+def test_profile_runtimes_are_advertised(client, boostie):
+    runtimes = caps(client, boostie)["profile_runtime_seconds"]
+    assert runtimes["workspace_coder"] == 120 * 60
