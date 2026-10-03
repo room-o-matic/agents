@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
 
+from agentd import ops
+
 SCHEMA = """
 create table if not exists sessions (
   id text primary key,
@@ -63,11 +65,28 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def init_db(path: Path) -> None:
+# docs#24: bump SCHEMA_VERSION with every schema change and add MIGRATIONS[old] to take a
+# database from `old` to `old + 1` (in one transaction, see ops.apply_schema). Keep SCHEMA
+# the full current schema for fresh databases. Version 1 is the unversioned baseline.
+SCHEMA_VERSION = 1
+MIGRATIONS: dict[int, ops.Migration] = {}
+
+
+def init_db(path: Path, backup_dir: Path | None = None) -> dict:
+    """Create or upgrade the database; raises ops.SchemaError for unsupported versions."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Version check first: a refused database must be left exactly as it was.
+    result = ops.apply_schema(
+        path,
+        service="agentd",
+        schema=SCHEMA,
+        version=SCHEMA_VERSION,
+        migrations=MIGRATIONS,
+        backup_dir=backup_dir,
+    )
     conn = connect(path)
     try:
         conn.execute("pragma journal_mode = wal")
-        conn.executescript(SCHEMA)
     finally:
         conn.close()
+    return result

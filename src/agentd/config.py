@@ -174,9 +174,15 @@ class Settings(BaseModel):
     lobbyd_api_key: str | None = Field(default=None, repr=False)
     registry_ttl_seconds: int = Field(default=60, ge=5, le=600)
 
+    min_free_bytes: int = 256 * 1024 * 1024  # readiness fails below this much free disk
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "agentd.sqlite"
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.data_dir / "backups"
 
     @property
     def sessions_dir(self) -> Path:
