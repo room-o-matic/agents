@@ -47,11 +47,11 @@ def test_read_send_and_notes(roomsd):
     assert len(tools.rooms_read(after_id=0)["messages"]) == 3
 
     tools.rooms_note_put("summary", {"state": "drafting"})
-    assert tools.rooms_note_get("summary") == {
-        "summary": {"state": "drafting"},
-        "updated_by": WORKER,
-    }
-    assert tools.rooms_note_get() == {"summary": {"state": "drafting"}}
+    note = tools.rooms_note_get("summary")
+    assert (note["summary"], note["updated_by"]) == ({"state": "drafting"}, WORKER)
+    assert note["provenance"]["trust"].startswith("untrusted")
+    notes = tools.rooms_note_get()
+    assert notes["summary"] == {"state": "drafting"} and "provenance" in notes
 
 
 def test_first_read_is_bounded(roomsd):
@@ -203,8 +203,8 @@ def test_mention_in_room_wakes_worker(room_client, roomsd, boostie):
         room_client, sid, boostie, lambda e: e["type"] == "needs_input" and e.get("turn") == 2
     )
     assert (
-        "[room message #4 from boostie@test (message)] @agentd-test.claude please review"
-        in (woke["question"])
+        '<room-message id="4" from="boostie@test" type="message" trust="untrusted">\n'
+        "@agentd-test.claude please review" in (woke["question"])
     )
     room_progress = [
         e for e in events(room_client, sid, boostie) if e.get("room_message_id") is not None
