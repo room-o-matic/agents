@@ -15,9 +15,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-import httpx
-
-from agentd import lobby_client
 from agentd.backends.process import (
     ProcessBackend,
     ProcessHandle,
@@ -28,6 +25,7 @@ from agentd.backends.process import (
 from agentd.backends.sandbox import LaunchSpec, SandboxBackend
 from agentd.config import CallerPolicy, Profile, Settings, WorkerType
 from agentd.events import EventStore
+from agentd.finalize import RoomFinalizer
 from agentd.ids import iso_in, new_id, now_iso
 from agentd.models import ACTIVE_STATUSES, RoomRef, SpawnRequest
 from agentd.policy import CallerPolicies, PolicyError, authorize, caller_workspace_ok
@@ -135,6 +133,12 @@ class Supervisor:
         self._launching = 0
         self._launching_by: dict[str, int] = {}
         self.policies = CallerPolicies(settings)
+        self.finalizer = RoomFinalizer(
+            conn,
+            events,
+            max_attempts=settings.finalize_max_attempts,
+            base_delay=settings.finalize_retry_seconds,
+        )
         self._live: dict[str, LiveSession] = {}
         # Set whenever active_count() changes, so the registry heartbeat can report promptly.
         self.capacity_changed = asyncio.Event()
@@ -302,6 +306,18 @@ class Supervisor:
         hard = profile.max_runtime_minutes * 60
         if req.timeout_seconds is not None:
             hard = min(hard, req.timeout_seconds)
+        if room is not None and room.expires_at:
+            # The session can't outlive its room access (docs#17): cap the hard deadline.
+            try:
+                remaining = (
+                    datetime.fromisoformat(room.expires_at.replace("Z", "+00:00"))
+                    - datetime.now(UTC)
+                ).total_seconds()
+            except ValueError as e:
+                raise SpawnError(422, f"room.expires_at isn't ISO 8601: {e}") from e
+            if remaining <= 0:
+                raise SpawnError(422, "the room invite has already expired")
+            hard = min(hard, remaining)
         idle = min(req.idle_timeout_seconds or s.default_idle_timeout_seconds, hard)
 
         session_id = new_id("agt")
@@ -323,8 +339,9 @@ class Supervisor:
                 "insert into sessions (id, instance_id, requester_agent, requester_surface,"
                 " requester_conversation_id, parent_session_id, profile, worker_type, status,"
                 " task, workspace_path, room_url, idle_timeout_seconds, created_at,"
-                " last_activity_at, expires_at, metadata_json, operation_id, payload_hash)"
-                " values (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " last_activity_at, expires_at, metadata_json, operation_id, payload_hash,"
+                " room_invite_id, room_finalization)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     s.instance_id,
@@ -344,6 +361,8 @@ class Supervisor:
                     json.dumps(req.metadata) if req.metadata is not None else None,
                     req.operation_id,
                     req.payload_hash() if req.operation_id else None,
+                    room.invite_id if room else None,
+                    "pending" if room else None,  # set now so a crash leaves a trace
                 ),
             )
         self.events.append(session_id, "status", status="starting")
@@ -371,6 +390,13 @@ class Supervisor:
             handle = await self.backend.start(worker.command, env, workspace or scratch_dir, spec)
         except OSError as e:
             self._set_terminal(session_id, "failed", f"worker failed to start: {e}")
+            if room is not None:  # never leave a live invite behind a failed launch
+                self.finalizer.start(
+                    session_id,
+                    room,
+                    "status",
+                    f"Session {session_id} on {s.instance_id} failed to start: {e}",
+                )
             return self.get_row(session_id)
         except BaseException:
             # Cancelled mid-launch: never leave the row looking like it's starting.
@@ -588,16 +614,8 @@ class Supervisor:
             body += f" ({reason})"
         if row["summary"]:
             body += f". Summary: {row['summary']}"
-        try:
-            await lobby_client.close_out_room(
-                live.room.base_url,
-                live.room.room_id,
-                live.room.token,
-                msg_type="handoff" if status == "completed" else "status",
-                body=body,
-            )
-        except httpx.HTTPError as e:
-            self.events.append(live.session_id, "room_error", reason=str(e))
+        msg_type = "handoff" if status == "completed" else "status"
+        self.finalizer.start(live.session_id, live.room, msg_type, body)
 
     # ----- caller actions ------------------------------------------------------------
 
@@ -669,7 +687,8 @@ class Supervisor:
 
     async def cleanup_once(self) -> None:
         """Start stops for timed-out sessions without awaiting them, so one slow stop
-        can't stall timeouts for every other session."""
+        can't stall timeouts for every other session; retry owed room finalizations."""
+        await self.finalizer.retry_due()
         now = datetime.now(UTC)
         for sid, live in list(self._live.items()):
             if live.stop_status is not None:
@@ -703,6 +722,8 @@ class Supervisor:
                 except ProcessLookupError:
                     pass
             self._set_terminal(row["id"], "failed", "gateway_restarted")
+        self.finalizer.recover()
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(self.stop(sid, "gateway_shutdown") for sid in list(self._live)))
+        await self.finalizer.drain(timeout=2 * self.settings.stop_grace_seconds)

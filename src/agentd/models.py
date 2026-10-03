@@ -28,6 +28,12 @@ class RoomRef(BaseModel):
 
     room_url: str = Field(pattern=ROOM_URL_RE, max_length=2048)
     token: str = Field(repr=False)
+    invite_id: str | None = Field(
+        default=None, max_length=64, description="non-secret; lets the inviter revoke later"
+    )
+    expires_at: str | None = Field(
+        default=None, description="invite expiry (ISO 8601); the session can't outlive it"
+    )
 
     @property
     def base_url(self) -> str:
@@ -92,6 +98,11 @@ class Session(BaseModel):
     exit_code: int | None
     summary: str | None
     events_url: str
+    room_invite_id: str | None = None
+    room_finalization: str | None = Field(
+        default=None, description="pending | done | revoked | owner_required (docs#17)"
+    )
+    room_finalization_error: str | None = None
 
 
 class MessageRequest(BaseModel):
@@ -127,6 +138,10 @@ class Capabilities(BaseModel):
     pairs: list[Pair] = Field(description="profile/worker_type combinations this gateway runs")
     allowed_for_you: list[Pair] = Field(description="the subset the calling principal may use")
     limits: dict[str, int]
+    profile_runtime_seconds: dict[str, int] = Field(
+        default_factory=dict,
+        description="max runtime per profile; mint room invites that last at least this long",
+    )
     cancellation: str
     isolation: Literal["none", "sandbox"]
 

@@ -65,6 +65,9 @@ def session_from_row(row: sqlite3.Row) -> Session:
         exit_code=row["exit_code"],
         summary=row["summary"],
         events_url=events_url(row["id"]),
+        room_invite_id=row["room_invite_id"],
+        room_finalization=row["room_finalization"],
+        room_finalization_error=row["room_finalization_error"],
     )
 
 
@@ -88,6 +91,9 @@ def capabilities(settings: Settings, caller) -> Capabilities:
         features=["operation_id", "sse_events", "room_invites", "task_grant", "caller_policy"],
         pairs=pairs,
         allowed_for_you=allowed,
+        profile_runtime_seconds={
+            p: int(prof.max_runtime_minutes * 60) for p, prof in settings.profiles.items()
+        },
         limits={
             "task_bytes": 64 * 1024,
             "message_bytes": 64 * 1024,

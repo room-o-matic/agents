@@ -74,11 +74,12 @@ async def deregister(settings: Settings) -> None:
             log.warning("registry deregister failed: %s", e)
 
 
-async def close_out_room(url: str, room_id: str, token: str, *, msg_type: str, body: str) -> None:
-    """Join (idempotent, in case the worker never did), post, then revoke the token.
-
-    Raises httpx.HTTPError; the caller records it as a room_error event.
-    """
+async def close_out_room(url: str, room_id: str, token: str, *, msg_type: str, body: str) -> dict:
+    """Join (idempotent, in case the worker never did), post the closing message, then
+    revoke the invite, checking every response (docs#17). Never raises for HTTP errors:
+    returns {"posted": bool, "revoked": bool, "error": str | None}. A 401 on revoke means the
+    token is already dead, which counts as revoked."""
+    posted, revoked, errors = False, False, []
     async with httpx.AsyncClient(base_url=url, headers=_auth(token), timeout=10) as client:
         try:
             r = await client.post(f"/v1/rooms/{room_id}/participants", json={})
@@ -87,5 +88,15 @@ async def close_out_room(url: str, room_id: str, token: str, *, msg_type: str, b
                 f"/v1/rooms/{room_id}/messages", json={"type": msg_type, "body": body}
             )
             r.raise_for_status()
-        finally:
-            await client.post("/v1/auth/revoke")
+            posted = True
+        except httpx.HTTPError as e:
+            errors.append(f"closing message: {e}")
+        try:
+            r = await client.post("/v1/auth/revoke")
+            if r.status_code in (200, 204, 401):
+                revoked = True
+            else:
+                errors.append(f"revoke: HTTP {r.status_code}")
+        except httpx.HTTPError as e:
+            errors.append(f"revoke: {e}")
+    return {"posted": posted, "revoked": revoked, "error": "; ".join(errors) or None}

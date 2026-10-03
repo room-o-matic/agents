@@ -156,6 +156,7 @@ def test_no_wakes_after_cancellation(worker, roomsd, boostie):
     wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input")
     c.post(f"/v1/sessions/{sid}/stop", headers=boostie)
     wait_status(c, sid, boostie)
+    wait_event(c, sid, boostie, lambda e: e["type"] == "room_finalization")  # docs#17
     before = len(events(c, sid, boostie))
     roomsd.post("boostie@test", "@agentd-test.claude are you there?")
     time.sleep(0.3)
