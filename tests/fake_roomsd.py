@@ -103,10 +103,18 @@ class FakeRoomsd:
                 if m := re.fullmatch(rf"{room}/notes/([\w.-]+)", p):
                     key = m.group(1)
                     if method == "PUT":
+                        body = self._body()
+                        current = fake.notes.get(key, {}).get("revision", 0)
+                        want = body.get("if_revision")
+                        if want is not None and want != current:
+                            return self._reply(
+                                412, {"detail": f"note {key!r} is at revision {current}"}
+                            )
                         fake.notes[key] = {
                             "key": key,
-                            "value": self._body()["value"],
+                            "value": body["value"],
                             "updated_by": who,
+                            "revision": current + 1,
                         }
                     if key not in fake.notes:
                         return self._reply(404, {"detail": "note not found"})
