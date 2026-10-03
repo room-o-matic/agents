@@ -55,6 +55,50 @@ def test_read_send_and_notes(roomsd):
     assert notes["summary"] == {"state": "drafting"} and "provenance" in notes
 
 
+def test_note_put_never_clobbers_an_unread_change(roomsd):
+    """Two workers share a note: a write based on a stale (or no) read is refused and comes
+    back with the current value to merge, instead of overwriting (docs#20)."""
+    a = RoomTools(roomsd.url, "room_1", "inv_worker")
+    b = RoomTools(roomsd.url, "room_1", "tok_boostie")
+    assert a.rooms_note_put("decisions", ["sqlite"])["revision"] == 1  # create
+    lost = b.rooms_note_put("decisions", ["uv"])  # b never read it: create-only fails
+    assert lost["conflict"] and not lost["written"]
+    assert lost["current_value"] == ["sqlite"] and lost["current_revision"] == 1
+    assert roomsd.notes["decisions"]["value"] == ["sqlite"]  # nothing overwritten
+    # the conflict told b the current revision, so a merged retry goes through
+    merged = b.rooms_note_put("decisions", [*lost["current_value"], "uv"])
+    assert merged["written"] and merged["revision"] == 2
+    # a's knowledge is now stale (revision 1): its write is refused too
+    stale = a.rooms_note_put("decisions", ["sqlite", "polling"])
+    assert stale["conflict"] and stale["current_value"] == ["sqlite", "uv"]
+    assert a.rooms_note_put("decisions", ["sqlite", "uv", "polling"])["revision"] == 3
+
+
+def test_note_get_and_read_record_revisions(roomsd):
+    a = RoomTools(roomsd.url, "room_1", "inv_worker")
+    b = RoomTools(roomsd.url, "room_1", "tok_boostie")
+    a.rooms_note_put("summary", "v1")
+    assert b.rooms_note_get("summary")["revision"] == 1
+    assert b.rooms_note_put("summary", "v2")["written"]  # read first, so it may replace
+    assert a.rooms_read(include_notes=["summary"])["note_revisions"] == {"summary": 2}
+    assert a.rooms_note_put("summary", "v3")["revision"] == 3
+    assert b.rooms_note_get()["revisions"] == {"summary": 3}
+
+
+def test_note_put_explicit_revision(roomsd):
+    a = RoomTools(roomsd.url, "room_1", "inv_worker")
+    a.rooms_note_put("k", 1)
+    b = RoomTools(roomsd.url, "room_1", "tok_boostie")
+    assert b.rooms_note_put("k", 2, if_revision=1)["written"]
+    assert b.rooms_note_put("k", 3, if_revision=1)["conflict"]
+
+
+def test_note_put_schema_exposes_if_revision():
+    server = room_tools.build_server(RoomTools("http://x", "room_1", "t"))
+    tools = {t.name: t for t in server._tool_manager.list_tools()}
+    assert "if_revision" in json.dumps(tools["rooms_note_put"].parameters)
+
+
 def test_first_read_is_bounded(roomsd):
     for i in range(room_tools.HISTORY_ON_FIRST_READ + 10):
         roomsd.post("boostie@test", f"m{i}")

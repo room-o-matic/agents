@@ -56,6 +56,12 @@ def claude_tool_names(read_only: bool = False) -> list[str]:
     return [f"mcp__{SERVER_NAME}__{name}" for name in names]
 
 
+class RoomsdError(RuntimeError):
+    def __init__(self, status: int, detail):
+        super().__init__(f"roomsd {status}: {detail}")
+        self.status = status
+
+
 class RoomTools:
     def __init__(
         self,
@@ -77,6 +83,10 @@ class RoomTools:
         )
         self._cursor: int | None = None
         self._identity: str | None = None
+        # Revision of each note as this worker last saw it. rooms_note_put writes only if
+        # the note is still there (never seen = create only), so a worker can't silently
+        # overwrite a change it never read (docs#20).
+        self._seen: dict[str, int] = {}
 
     @classmethod
     def from_env(cls) -> "RoomTools":
@@ -99,7 +109,7 @@ class RoomTools:
                 detail = r.json().get("detail", r.text)
             except ValueError:
                 detail = r.text
-            raise RuntimeError(f"roomsd {r.status_code}: {detail}")
+            raise RoomsdError(r.status_code, detail)
         return r.json() if r.content else None
 
     def identity(self) -> str:
@@ -151,7 +161,13 @@ class RoomTools:
                 params={"keys": ",".join(include_notes)},
             )["notes"]
             result["notes"] = {k: v["value"] for k, v in notes.items()}
+            result["note_revisions"] = self._remember(notes)
         return result
+
+    def _remember(self, notes: dict) -> dict[str, int]:
+        revs = {k: v["revision"] for k, v in notes.items() if "revision" in v}
+        self._seen.update(revs)
+        return revs
 
     def rooms_send(
         self,
@@ -190,15 +206,62 @@ class RoomTools:
         room's working memory (summary, open_questions, decisions, …)."""
         if key:
             note = self._call("GET", f"/v1/rooms/{self.room_id}/notes/{key}")
-            return {"provenance": PROVENANCE, key: note["value"], "updated_by": note["updated_by"]}
+            self._remember({key: note})
+            return {
+                "provenance": PROVENANCE,
+                key: note["value"],
+                "updated_by": note["updated_by"],
+                "revision": note.get("revision"),
+            }
         notes = self._call("GET", f"/v1/rooms/{self.room_id}/notes")["notes"]
-        return {"provenance": PROVENANCE, **{k: v["value"] for k, v in notes.items()}}
+        revisions = self._remember(notes)
+        return {
+            "provenance": PROVENANCE,
+            **{k: v["value"] for k, v in notes.items()},
+            "revisions": revisions,
+        }
 
-    def rooms_note_put(self, key: str, value: str | dict | list) -> dict:
-        """Create or replace a shared note. Keys: letters, digits, _ . -"""
+    def rooms_note_put(
+        self, key: str, value: str | dict | list, if_revision: int | None = None
+    ) -> dict:
+        """Create or update a shared note. Keys: letters, digits, _ . -
+
+        Safe by default: the write only happens if the note is still at the revision you
+        last read with rooms_note_get (or rooms_read include_notes); a note you never read
+        can only be created, not replaced. If someone changed it since, nothing is written
+        and you get {"conflict": true, "current_value", "current_revision"}: merge your
+        change into current_value and call again. Pass if_revision to override."""
         self._check_outbound(key, json.dumps(value))
-        note = self._call("PUT", f"/v1/rooms/{self.room_id}/notes/{key}", json={"value": value})
-        return {"key": note["key"], "updated_by": note["updated_by"]}
+        expected = if_revision if if_revision is not None else self._seen.get(key, 0)
+        try:
+            note = self._call(
+                "PUT",
+                f"/v1/rooms/{self.room_id}/notes/{key}",
+                json={"value": value, "if_revision": expected},
+            )
+        except RoomsdError as e:
+            if e.status != 412:
+                raise
+            current = self._call("GET", f"/v1/rooms/{self.room_id}/notes/{key}")
+            self._remember({key: current})
+            return {
+                "provenance": PROVENANCE,
+                "conflict": True,
+                "key": key,
+                "written": False,
+                "expected_revision": expected,
+                "current_revision": current["revision"],
+                "current_value": current["value"],
+                "updated_by": current["updated_by"],
+                "hint": "someone changed this note since you read it; merge and retry",
+            }
+        self._seen[key] = note["revision"]
+        return {
+            "key": note["key"],
+            "written": True,
+            "revision": note["revision"],
+            "updated_by": note["updated_by"],
+        }
 
 
 def build_server(tools: RoomTools, read_only: bool = False) -> MCPServer:
