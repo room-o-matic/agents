@@ -14,55 +14,13 @@ If ROOMSD_* env vars are set, it joins the room and posts a status message first
 way a real worker announces itself.
 """
 
-import json
 import os
 import signal
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
-
-def emit(type: str, **fields) -> None:
-    print("AGENT_EVENT " + json.dumps({"type": type, **fields}), flush=True)
-
-
-def read_msg() -> dict | None:
-    line = sys.stdin.readline()
-    return json.loads(line) if line else None
-
-
-def roomsd(method: str, path: str, body: dict | None = None) -> None:
-    req = urllib.request.Request(
-        os.environ["ROOMSD_URL"] + path,
-        method=method,
-        data=json.dumps(body or {}).encode(),
-        headers={
-            "Authorization": f"Bearer {os.environ['ROOMSD_TOKEN']}",
-            "Content-Type": "application/json",
-        },
-    )
-    urllib.request.urlopen(req, timeout=10).read()
-
-
-def announce_in_room() -> None:
-    room = os.environ.get("ROOMSD_ROOM_ID")
-    if not room or not os.environ.get("ROOMSD_URL"):
-        return
-    try:
-        roomsd("POST", f"/v1/rooms/{room}/participants")
-        roomsd(
-            "POST",
-            f"/v1/rooms/{room}/messages",
-            {
-                "type": "status",
-                "body": f"session {os.environ['AGENTD_SESSION_ID']} on "
-                f"{os.environ['AGENTD_INSTANCE_ID']} started",
-            },
-        )
-        emit("progress", message=f"joined room {room}")
-    except OSError as e:
-        emit("error", message=f"could not join room {room}: {e}")
+from agentd.workers.common import announce_in_room, emit, read_msg
 
 
 def write_artifact(name: str, text: str) -> None:

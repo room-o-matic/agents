@@ -9,7 +9,7 @@ base_url: http://host1:8765        # advertised in the registry; the audience ca
 max_sessions: 4                    # concurrent active sessions; more get 429
 workspace_roots:                   # workspace paths must resolve under one of these
   - /home/openclaw/.openclaw/workspace
-env_allowlist: [PATH, HOME, LANG, LC_ALL, TZ]
+env_allowlist: [PATH, HOME, LANG, LC_ALL, TZ]  # add ANTHROPIC_API_KEY if claude authenticates with one
 
 default_idle_timeout_seconds: 600
 ready_timeout_seconds: 60          # worker must emit an AGENT_EVENT within this
@@ -32,6 +32,15 @@ profiles:
 worker_types:
   fake:
     command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.fake]  # use absolute paths
+  # Claude Code (milestone 2). Tool permissions come from the session's profile: no shell
+  # unless the profile sets `shell: true`, so workers run `claude --restricted`. Profiles
+  # may also set max_budget_usd, claude_tools, claude_permission_mode.
+  claude:
+    command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.claude_code,
+              --claude, /usr/local/bin/claude, --model, sonnet, --max-budget-usd, "2"]
+  claude-chat:                     # stays up between turns; stop ends it as completed
+    command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.claude_code,
+              --claude, /usr/local/bin/claude, --interactive, --max-budget-usd, "5"]
 
 # lobbyd: callers authenticate with lobbyd access tokens for this instance's base_url, and
 # the instance heartbeats into lobbyd's registry when lobbyd_api_key is set.
