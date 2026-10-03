@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import httpx
 
+from agentd import ops
 from agentd.config import Settings
 from agentd.models import PROTOCOL
 
@@ -46,16 +47,22 @@ async def register(client: httpx.AsyncClient, settings: Settings, active_session
 
 
 async def heartbeat_loop(
-    settings: Settings, active_sessions: Callable[[], int], changed: asyncio.Event
+    settings: Settings,
+    active_sessions: Callable[[], int],
+    changed: asyncio.Event,
+    health: ops.LoopHealth | None = None,
 ) -> None:
     """Heartbeat every ttl/3, and immediately whenever the active session count changes."""
+    health = health or ops.LoopHealth()
     interval = settings.registry_ttl_seconds / 3
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             changed.clear()
             try:
                 await register(client, settings, active_sessions())
+                health.ok()
             except httpx.HTTPError as e:
+                health.failed(e)
                 log.warning("registry heartbeat to %s failed: %s", settings.lobbyd_url, e)
             try:
                 await asyncio.wait_for(changed.wait(), interval)

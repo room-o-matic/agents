@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shutil
 import sqlite3
 from collections.abc import AsyncIterator
 from typing import Annotated
@@ -10,7 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agentd import db, lobby_client
+from agentd import db, lobby_client, ops
 from agentd.config import Settings
 from agentd.events import EventStore
 from agentd.models import (
@@ -117,9 +118,12 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         jwks_url=settings.lobbyd_jwks_url,
     )
 
+    registry_health = ops.LoopHealth()
+
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        db.init_db(settings.db_path)
+        # docs#24: upgrades the schema (after a pre-upgrade backup) or refuses to start.
+        db.init_db(settings.db_path, backup_dir=settings.backup_dir)
         settings.sessions_dir.mkdir(parents=True, exist_ok=True)
         conn = db.connect(settings.db_path)
         supervisor = Supervisor(settings, conn, EventStore(conn, settings.sessions_dir))
@@ -131,7 +135,10 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
             tasks.append(
                 asyncio.create_task(
                     lobby_client.heartbeat_loop(
-                        settings, supervisor.active_count, supervisor.capacity_changed
+                        settings,
+                        supervisor.active_count,
+                        supervisor.capacity_changed,
+                        registry_health,
                     )
                 )
             )
@@ -191,6 +198,88 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    def checks(request: Request) -> dict:
+        """Readiness (docs#24): can this gateway actually run sessions?"""
+        supervisor = sup(request)
+        conn = request.app.state.conn
+        version = ops.read_schema_version(conn)
+        marks = ",".join("?" * len(ACTIVE_STATUSES))
+        active_ids = {
+            r[0]
+            for r in conn.execute(
+                f"select id from sessions where status in ({marks})", ACTIVE_STATUSES
+            )
+        }
+        # Launches in progress have a row before they join _live.
+        orphaned = max(0, len(active_ids - set(supervisor._live)) - supervisor._launching)
+        finalization = dict(
+            conn.execute(
+                "select room_finalization, count(*) from sessions"
+                " where room_finalization in ('pending', 'owner_required')"
+                " group by room_finalization"
+            ).fetchall()
+        )
+        db_error = ops.db_writable(settings.db_path)
+        free = shutil.disk_usage(settings.data_dir).free
+        jwks = verifier.health()
+        age = registry_health.age()
+        return {
+            "database": {"ok": db_error is None, "error": db_error},
+            "schema": {"ok": version == db.SCHEMA_VERSION, "version": version},
+            "storage": {"ok": free >= settings.min_free_bytes, "free_bytes": free},
+            "jwks": {"ok": not jwks["failing_closed"], **jwks},
+            # Sessions the database says are active but no live worker backs: a gateway
+            # bug or a crash in progress; not ready until recover() has dealt with them.
+            "sessions": {
+                "ok": orphaned == 0,
+                "active": supervisor.active_count(),
+                "orphaned": orphaned,
+                "room_finalization_pending": finalization.get("pending", 0),
+                "room_finalization_owner_required": finalization.get("owner_required", 0),
+            },
+            # Direct callers still work without the registry: reported, not required.
+            "registry": {
+                "ok": not settings.registry_enabled
+                or (age is not None and age <= 3 * settings.registry_ttl_seconds),
+                "required": False,
+                "enabled": settings.registry_enabled,
+                "age_seconds": age,
+                "consecutive_failures": registry_health.failures,
+                "last_error": registry_health.last_error,
+            },
+        }
+
+    def is_ready(c: dict) -> bool:
+        return all(v["ok"] for v in c.values() if v.get("required", True))
+
+    @app.get("/readyz")
+    async def readyz(request: Request, response: Response) -> dict:
+        c = checks(request)
+        response.status_code = 200 if is_ready(c) else 503
+        return {"ready": is_ready(c), "checks": c}
+
+    @app.get("/metrics")
+    async def metrics(request: Request) -> Response:
+        c = checks(request)
+        s = c["sessions"]
+        gauges = {
+            "ready": is_ready(c),
+            "schema_version": c["schema"]["version"],
+            "db_bytes": settings.db_path.stat().st_size,
+            "disk_free_bytes": c["storage"]["free_bytes"],
+            "jwks_age_seconds": c["jwks"]["age_seconds"],
+            "jwks_fetch_failures": c["jwks"]["consecutive_failures"],
+            "jwks_failing_closed": c["jwks"]["failing_closed"],
+            "registry_age_seconds": c["registry"]["age_seconds"],
+            "registry_failures": c["registry"]["consecutive_failures"],
+            "active_sessions": s["active"],
+            "max_sessions": settings.max_sessions,
+            "orphaned_sessions": s["orphaned"],
+            "room_finalization_pending": s["room_finalization_pending"],
+            "room_finalization_owner_required": s["room_finalization_owner_required"],
+        }
+        return Response(ops.prometheus("agentd", gauges), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/instance")
     async def instance(request: Request, agent: Agent) -> InstanceInfo:

@@ -100,6 +100,20 @@ class TokenVerifier:
         self._inflight: threading.Event | None = None
         self.fetches = 0  # attempts made; for tests and metrics
 
+    def health(self) -> dict:
+        """For readiness and metrics (docs#24): when keys were last confirmed with lobbyd,
+        and whether verification is failing closed right now."""
+        with self._lock:
+            age = None if self._fetched_at is None else self._clock() - self._fetched_at
+            return {
+                "fetched": self._fetched_at is not None,
+                "age_seconds": age,
+                "consecutive_failures": self._failures,
+                "fetches": self.fetches,
+                "failing_closed": (age is not None and age > self.max_stale_seconds)
+                or (age is None and self._failures > 0),
+            }
+
     # ----- cache ---------------------------------------------------------------------
 
     def _due(self, now: float, *, unknown_kid: bool) -> bool:
