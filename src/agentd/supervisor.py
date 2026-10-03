@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -101,6 +102,14 @@ class LiveSession:
     final_seen: bool = False
     log_bytes: int = 0
     log_truncated: bool = False
+    # docs#22: structured-event budget
+    event_bytes: int = 0
+    event_count: int = 0
+    output_truncated: bool = False
+    rate_tokens: float = -1  # -1: start with a full burst
+    rate_at: float = 0
+    throttling: bool = False
+    dropped_events: int = 0
     # Set by stop(); applied when the process exits unless the worker already sent final.
     stop_status: str | None = None
     stop_reason: str | None = None
@@ -445,31 +454,84 @@ class Supervisor:
             return
         self.events.append(live.session_id, "log", stream=stream, text=text)
 
+    def _admit_event(self, live: LiveSession, event: dict) -> bool:
+        """Charge a structured worker event to the session's budgets (docs#22)."""
+        if live.output_truncated:
+            live.dropped_events += 1
+            return False
+        st = self.settings
+        now = time.monotonic()
+        if live.rate_tokens < 0:
+            live.rate_tokens = st.event_burst
+        else:
+            live.rate_tokens = min(
+                st.event_burst, live.rate_tokens + (now - live.rate_at) * st.event_rate_per_second
+            )
+        live.rate_at = now
+        if live.rate_tokens < 1:
+            live.dropped_events += 1
+            if not live.throttling:
+                live.throttling = True
+                self._charge(live, 0)
+                self.events.append(
+                    live.session_id,
+                    "output_throttled",
+                    reason=f"worker events over {st.event_rate_per_second}/s;"
+                    " dropping until the rate falls",
+                )
+            return False
+        live.rate_tokens -= 1
+        live.throttling = False
+        size = len(json.dumps(event))
+        if live.event_count + 1 > st.max_events or live.event_bytes + size > st.max_event_bytes:
+            live.output_truncated = True
+            live.dropped_events += 1
+            self.events.append(
+                live.session_id,
+                "output_truncated",
+                reason=f"worker events exceeded {st.max_events} events or"
+                f" {st.max_event_bytes} bytes; further events are dropped",
+            )
+            return False
+        self._charge(live, size)
+        return True
+
+    @staticmethod
+    def _charge(live: LiveSession, size: int) -> None:
+        live.event_count += 1
+        live.event_bytes += size
+
     def _record_worker_event(self, live: LiveSession, event: dict) -> None:
         sid = live.session_id
         kind = event["type"]
-        if kind == "protocol_error":
-            self.events.append(sid, **event)
-            return
-        if not live.ready:
+        if kind == "final" and live.final_seen:
+            event = {"type": "protocol_error", "reason": "duplicate final ignored"}
+            kind = "protocol_error"
+        if kind != "protocol_error" and not live.ready:
             self._mark_running(live)
         if kind == "artifact":
             name, path = event.get("name"), event.get("path") or event.get("name")
             if not isinstance(name, str) or not isinstance(path, str):
-                self.events.append(sid, "protocol_error", reason="artifact needs name and path")
-                return
-            resolved = (live.artifacts_dir / path).resolve()
-            if not resolved.is_relative_to(live.artifacts_dir.resolve()):
-                self.events.append(
-                    sid, "protocol_error", reason="artifact path escapes artifacts dir", text=path
-                )
-                return
-            event = {**event, "path": str(resolved), "exists": resolved.is_file()}
+                event = {"type": "protocol_error", "reason": "artifact needs name and path"}
+            else:
+                resolved = (live.artifacts_dir / path).resolve()
+                if not resolved.is_relative_to(live.artifacts_dir.resolve()):
+                    event = {
+                        "type": "protocol_error",
+                        "reason": "artifact path escapes artifacts dir",
+                        "text": path,
+                    }
+                else:
+                    event = {**event, "path": str(resolved), "exists": resolved.is_file()}
         elif kind == "final":
+            # The terminal result is never dropped by the output budget.
             live.final_seen = True
             live.final_summary = event.get("summary")
             live.tasks.append(asyncio.create_task(self._reap_after_final(live)))
-        self.events.append(sid, **event)
+            self.events.append(sid, **event)
+            return
+        if self._admit_event(live, event):
+            self.events.append(sid, **event)
 
     async def _read_stdout(self, live: LiveSession) -> None:
         async for line in iter_lines(live.handle.stdout, self.settings.max_line_bytes):
@@ -479,11 +541,13 @@ class Supervisor:
                 self._record_log(live, "stdout", line)
             else:
                 self._record_worker_event(live, event)
+            await asyncio.sleep(0)  # docs#22: a chatty worker must not starve the loop
 
     async def _read_stderr(self, live: LiveSession) -> None:
         async for line in iter_lines(live.handle.stderr, self.settings.max_line_bytes):
             self._touch(live.session_id)
             self._record_log(live, "stderr", line)
+            await asyncio.sleep(0)
 
     async def _ready_watchdog(self, live: LiveSession) -> None:
         await asyncio.sleep(self.settings.ready_timeout_seconds)
@@ -689,6 +753,7 @@ class Supervisor:
         """Start stops for timed-out sessions without awaiting them, so one slow stop
         can't stall timeouts for every other session; retry owed room finalizations."""
         await self.finalizer.retry_due()
+        self.prune_events()
         now = datetime.now(UTC)
         for sid, live in list(self._live.items()):
             if live.stop_status is not None:
@@ -700,6 +765,31 @@ class Supervisor:
             idle = (now - datetime.fromisoformat(row["last_activity_at"])).total_seconds()
             if idle >= row["idle_timeout_seconds"]:
                 self._stop_in_background(sid, "idle_timeout", "expired")
+
+    def prune_events(self) -> int:
+        """Retention (docs#22): drop the event log of sessions that ended more than
+        event_retention_days ago. The session row, status and summary stay."""
+        days = self.settings.event_retention_days
+        if days is None:
+            return 0
+        cutoff = iso_in(-days * 86400)
+        placeholders = ",".join("?" * len(ACTIVE_STATUSES))
+        ids = [
+            r[0]
+            for r in self.conn.execute(
+                f"select id from sessions where stopped_at is not null and stopped_at < ?"
+                f" and status not in ({placeholders})"
+                " and exists (select 1 from events e where e.session_id = sessions.id)",
+                (cutoff, *ACTIVE_STATUSES),
+            )
+        ]
+        for sid in ids:
+            with self.conn:
+                self.conn.execute("delete from events where session_id = ?", (sid,))
+            (self.settings.sessions_dir / sid / "events.jsonl").unlink(missing_ok=True)
+        if ids:
+            log.info("pruned event logs of %d ended sessions", len(ids))
+        return len(ids)
 
     async def cleanup_loop(self) -> None:
         while True:

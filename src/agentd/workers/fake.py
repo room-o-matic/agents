@@ -6,6 +6,9 @@
     linger       emit final but don't exit (exercises reaping after final)
     stubborn     ignore stop requests and SIGTERM (exercises SIGKILL)
     chatty N     print N plain log lines, then final
+    flood N S    emit N progress events of S characters as fast as possible, then final
+    finals N     emit N final events, then exit
+    badflood N   emit N malformed protocol lines, then final
     badjson      emit malformed and reserved events, then final
     escape       emit an artifact whose path escapes the artifacts dir, then final
     badfinal K   emit a final whose summary is a K (dict|list|number), then exit
@@ -104,6 +107,21 @@ def main() -> int:
         for i in range(int(arg or 10)):
             print(f"line {i} " + "x" * 100, flush=True)
         emit("final", summary="chatted")
+        return 0
+    if mode == "flood":
+        n, size = (int(x) for x in arg.split())
+        for i in range(n):
+            emit("progress", message=f"{i} " + "x" * size)
+        emit("final", summary="flooded")
+        return 0
+    if mode == "finals":
+        for i in range(int(arg)):
+            emit("final", summary=f"final {i}")
+        return 0
+    if mode == "badflood":
+        for _ in range(int(arg)):
+            print("AGENT_EVENT {not json", flush=True)
+        emit("final", summary="survived")
         return 0
     if mode == "badjson":
         print("AGENT_EVENT {not json", flush=True)

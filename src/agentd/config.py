@@ -137,7 +137,19 @@ class Settings(BaseModel):
     max_pending_stdin_bytes: int = 1024 * 1024
     cleanup_interval_seconds: float = 30
     max_line_bytes: int = 64 * 1024
-    max_log_bytes: int = 8 * 1024 * 1024
+    max_log_bytes: int = 8 * 1024 * 1024  # raw (non-protocol) stdout/stderr per session
+    # docs#22: budgets for a session's structured worker events (progress, artifact,
+    # protocol_error, ...), separate from the raw-log cap. Past either total the session
+    # gets one output_truncated record and further events are dropped; past the rate,
+    # events are dropped (one output_throttled record per episode). The first final is
+    # always recorded.
+    max_event_bytes: int = 8 * 1024 * 1024
+    max_events: int = 10_000
+    event_rate_per_second: float = 50
+    event_burst: int = 200
+    # Events (SQLite and events.jsonl) of sessions that ended longer ago than this are
+    # deleted by the cleanup loop; the session row and its summary stay. None keeps all.
+    event_retention_days: float | None = 14
 
     profiles: dict[str, Profile] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     worker_types: dict[str, WorkerType] = Field(default_factory=lambda: dict(DEFAULT_WORKER_TYPES))
