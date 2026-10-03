@@ -35,7 +35,7 @@ from pathlib import Path
 import httpx
 
 from agentd.workers import room_tools
-from agentd.workers.common import announce_in_room, emit, post_room_status
+from agentd.workers.common import announce_in_room, emit, join_room, post_room_status
 from agentd.workers.wake import WakeGate
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
@@ -329,7 +329,16 @@ class Adapter:
         if not first or first.get("type") != "task":
             emit("error", message="expected a task message first")
             return 2
-        announce_in_room()
+        # Join, then fix where room wakes start, then announce: anything posted after this
+        # worker is in the room (e.g. an @mention sent the moment it's summoned) wakes it.
+        if join_room() is not None and self.args.room_wake != "none":
+            self.watcher = RoomWatcher.from_env(self.args)
+            try:
+                await self.watcher.start()
+            except httpx.HTTPError as e:
+                emit("error", message=f"room watcher stopped: {e}")
+                self.watcher = None
+        announce_in_room(join=False)
 
         profile = json.loads(os.environ.get("AGENTD_PROFILE") or "{}")
         cmd = build_command(self.args, profile, dict(os.environ))
@@ -348,8 +357,7 @@ class Adapter:
         output = asyncio.create_task(self._pump_claude())
         inbox = asyncio.create_task(self._pump_gateway(gateway))
         watcher = None
-        if has_room(dict(os.environ)) and self.args.room_wake != "none":
-            self.watcher = RoomWatcher.from_env(self.args)
+        if self.watcher is not None:
             watcher = asyncio.create_task(self.watcher.run(self._room_turn))
         await asyncio.wait({output, inbox}, return_when=asyncio.FIRST_COMPLETED)
         inbox.cancel()
@@ -516,6 +524,7 @@ class RoomWatcher:
             transport=transport,
         )
         self.identity = ""
+        self.cursor: int | None = None
 
     @classmethod
     def from_env(cls, args: argparse.Namespace) -> "RoomWatcher":
@@ -535,14 +544,22 @@ class RoomWatcher:
         r.raise_for_status()
         return r.json()
 
+    async def start(self) -> None:
+        """Learn who we are and where the room ends now. Call it once joined and before
+        announcing, so nothing posted after the worker arrives can slip past."""
+        r = await self._http.get("/v1/auth/whoami")
+        r.raise_for_status()
+        self.identity = r.json()["agent"]
+        cursor = 0
+        while (page := await self._page(cursor))["messages"]:
+            cursor = page["latest_message_id"]
+        self.cursor = cursor
+
     async def run(self, on_message) -> None:
         try:
-            r = await self._http.get("/v1/auth/whoami")
-            r.raise_for_status()
-            self.identity = r.json()["agent"]
-            cursor = 0
-            while (page := await self._page(cursor))["messages"]:
-                cursor = page["latest_message_id"]
+            if self.cursor is None:
+                await self.start()
+            cursor = self.cursor
             while True:
                 await asyncio.sleep(self.poll)
                 try:
