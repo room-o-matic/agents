@@ -18,7 +18,13 @@ from pathlib import Path
 import httpx
 
 from agentd import lobby_client
-from agentd.backends.process import ProcessBackend, ProcessHandle, find_orphan, iter_lines
+from agentd.backends.process import (
+    ProcessBackend,
+    ProcessHandle,
+    WorkerNotReading,
+    find_orphan,
+    iter_lines,
+)
 from agentd.config import Profile, Settings
 from agentd.events import EventStore
 from agentd.ids import iso_in, new_id, now_iso
@@ -65,7 +71,11 @@ class Supervisor:
         self.settings = settings
         self.conn = conn
         self.events = events
-        self.backend = backend or ProcessBackend()
+        self.backend = backend or ProcessBackend(
+            max_pending_bytes=settings.max_pending_stdin_bytes,
+            send_timeout=settings.send_timeout_seconds,
+        )
+        self._background: set[asyncio.Task] = set()
         self._live: dict[str, LiveSession] = {}
         # Set whenever active_count() changes, so the registry heartbeat can report promptly.
         self.capacity_changed = asyncio.Event()
@@ -297,16 +307,66 @@ class Supervisor:
         except TimeoutError:
             await self._terminate(live)
 
+    async def _read_output(self, live: LiveSession) -> None:
+        await asyncio.gather(self._read_stdout(live), self._read_stderr(live))
+
+    async def _wait_group_gone(self, live: LiveSession, timeout: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while live.handle.group_alive():
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    async def _reap_group(self, live: LiveSession) -> None:
+        """After the leader exits, end every process left in its group (SIGTERM, then
+        SIGKILL). Lifecycle ownership isn't released while descendants remain."""
+        if not live.handle.group_alive():
+            return
+        grace = self.settings.stop_grace_seconds
+        live.handle.terminate()
+        if await self._wait_group_gone(live, grace):
+            return
+        live.handle.kill()
+        if not await self._wait_group_gone(live, grace):
+            self.events.append(
+                live.session_id,
+                "protocol_error",
+                reason="worker process group still alive after SIGKILL",
+            )
+
     async def _run(self, live: LiveSession) -> None:
         sid = live.session_id
+        grace = self.settings.stop_grace_seconds
         watchdog = asyncio.create_task(self._ready_watchdog(live))
+        readers = asyncio.create_task(self._read_output(live))
+        leader = asyncio.create_task(live.handle.wait())
         try:
-            await asyncio.gather(self._read_stdout(live), self._read_stderr(live))
-            exit_code = await live.handle.wait()
+            done, _ = await asyncio.wait({readers, leader}, return_when=asyncio.FIRST_COMPLETED)
+            if readers in done and readers.exception():
+                raise readers.exception()
+            exit_code = await leader
+            await self._reap_group(live)
+            # Output normally closes with the group. A process that escaped the group can
+            # hold the pipes open; don't let it keep the session alive.
+            try:
+                await asyncio.wait_for(asyncio.shield(readers), grace)
+            except TimeoutError:
+                readers.cancel()
+                self.events.append(
+                    sid,
+                    "protocol_error",
+                    reason="worker output still open after its process group exited",
+                )
+            else:
+                if readers.exception():
+                    raise readers.exception()
         except Exception as e:  # noqa: BLE001 - any supervisor bug must still end the session
             log.exception("session %s supervisor error", sid)
+            readers.cancel()
             await self._terminate(live)
-            exit_code = await live.handle.wait()
+            exit_code = await leader
+            await self._reap_group(live)
             live.stop_status, live.stop_reason = "failed", f"gateway error: {e}"
         finally:
             watchdog.cancel()
@@ -373,18 +433,26 @@ class Supervisor:
 
     # ----- caller actions ------------------------------------------------------------
 
-    async def send_message(self, session_id: str, message: str, sender: str) -> bool:
+    async def send_message(self, session_id: str, message: str, sender: str) -> str | None:
+        """Deliver a caller message. Returns None on success, else why it was refused."""
         live = self._live.get(session_id)
         if live is None or live.final_seen or live.stop_status:
-            return False
-        async with live.stdin_lock:
-            try:
-                await live.handle.send({"type": "message", "sender": sender, "message": message})
-            except (BrokenPipeError, ConnectionResetError):
-                return False
+            return "session is not accepting messages"
+        try:
+            async with asyncio.timeout(self.settings.send_timeout_seconds):
+                async with live.stdin_lock:
+                    await live.handle.send(
+                        {"type": "message", "sender": sender, "message": message}
+                    )
+        except WorkerNotReading as e:
+            return str(e)
+        except (BrokenPipeError, ConnectionResetError):
+            return "worker input is closed"
+        except TimeoutError:
+            return "worker input is busy"
         self.events.append(session_id, "message", sender=sender, message=message)
         self._touch(session_id)
-        return True
+        return None
 
     async def _terminate(self, live: LiveSession) -> None:
         """SIGTERM the process group, then SIGKILL after the grace period."""
@@ -395,38 +463,56 @@ class Supervisor:
             live.handle.kill()
 
     async def stop(self, session_id: str, reason: str, status: str = "stopped") -> None:
-        """Ask the worker to stop, then SIGTERM, then SIGKILL. Returns once it has exited."""
+        """Ask the worker to stop, then SIGTERM, then SIGKILL. Returns once the session has
+        ended (process group gone). The deadline starts first: a worker that isn't reading
+        stdin, or a send holding the input lock, can only delay escalation by the grace."""
         live = self._live.get(session_id)
         if live is None:
             return
         if live.stop_status is None:
             live.stop_status, live.stop_reason = status, reason
-        async with live.stdin_lock:
-            try:
-                await live.handle.send({"type": "stop", "reason": reason})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            live.handle.close_stdin()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.stop_grace_seconds
+
+        async def ask() -> None:
+            async with live.stdin_lock:
+                try:
+                    await live.handle.send({"type": "stop", "reason": reason})
+                except (BrokenPipeError, ConnectionResetError, WorkerNotReading):
+                    pass
+                live.handle.close_stdin()
+
         try:
-            await asyncio.wait_for(live.finished.wait(), self.settings.stop_grace_seconds)
+            await asyncio.wait_for(ask(), self.settings.stop_grace_seconds)
+        except TimeoutError:
+            pass
+        try:
+            await asyncio.wait_for(live.finished.wait(), max(0.0, deadline - loop.time()))
         except TimeoutError:
             await self._terminate(live)
         await live.finished.wait()
 
     # ----- housekeeping --------------------------------------------------------------
 
+    def _stop_in_background(self, session_id: str, reason: str, status: str) -> None:
+        task = asyncio.create_task(self.stop(session_id, reason, status=status))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
     async def cleanup_once(self) -> None:
+        """Start stops for timed-out sessions without awaiting them, so one slow stop
+        can't stall timeouts for every other session."""
         now = datetime.now(UTC)
-        stops = []
-        for sid in list(self._live):
+        for sid, live in list(self._live.items()):
+            if live.stop_status is not None:
+                continue  # already stopping
             row = self.get_row(sid)
             if datetime.fromisoformat(row["expires_at"]) <= now:
-                stops.append(self.stop(sid, "hard_timeout", status="expired"))
+                self._stop_in_background(sid, "hard_timeout", "expired")
                 continue
             idle = (now - datetime.fromisoformat(row["last_activity_at"])).total_seconds()
             if idle >= row["idle_timeout_seconds"]:
-                stops.append(self.stop(sid, "idle_timeout", status="expired"))
-        await asyncio.gather(*stops)
+                self._stop_in_background(sid, "idle_timeout", "expired")
 
     async def cleanup_loop(self) -> None:
         while True:

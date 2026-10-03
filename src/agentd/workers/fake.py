@@ -9,6 +9,9 @@
     badjson      emit malformed and reserved events, then final
     escape       emit an artifact whose path escapes the artifacts dir, then final
     badfinal K   emit a final whose summary is a K (dict|list|number), then exit
+    deaf         emit progress, then never read stdin again
+    orphan [stubborn]  start a child in the same process group with stdio redirected
+                 (ignoring SIGTERM if stubborn), report its pid, emit final, exit
     (anything)   progress, a log line, an artifact, final
 
 If ROOMSD_* env vars are set, it joins the room and posts a status message first, the
@@ -65,6 +68,24 @@ def main() -> int:
         print("AGENT_EVENT {not json", flush=True)
         emit("status", status="completed")  # reserved for the gateway
         emit("final", summary="survived bad output")
+        return 0
+    if mode == "deaf":
+        emit("progress", message="not listening")
+        time.sleep(3600)
+        return 0
+    if mode == "orphan":
+        import subprocess
+
+        ignore = "signal.signal(signal.SIGTERM, signal.SIG_IGN); " if arg == "stubborn" else ""
+        child = subprocess.Popen(
+            [sys.executable, "-c", f"import signal, time; {ignore}time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)  # let the child install its signal handler
+        emit("progress", message="spawned child", child_pid=child.pid)
+        emit("final", summary="done, child left running")
         return 0
     if mode == "badfinal":
         emit("progress", message="about to send a malformed final")

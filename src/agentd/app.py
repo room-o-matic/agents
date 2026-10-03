@@ -203,11 +203,9 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
     ) -> MessageAccepted:
         assert_identity(agent, req.sender)
         own_session(request, session_id, agent)
-        if not await sup(request).send_message(session_id, req.message, agent):
+        if refused := await sup(request).send_message(session_id, req.message, agent):
             row = sup(request).get_row(session_id)
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, f"session is not accepting messages ({row['status']})"
-            )
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{refused} ({row['status']})")
         return MessageAccepted(accepted=True, status=sup(request).get_row(session_id)["status"])
 
     @app.post("/v1/sessions/{session_id}/stop")
