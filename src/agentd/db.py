@@ -62,7 +62,30 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("pragma foreign_keys = on")
     conn.execute("pragma busy_timeout = 10000")
+    # WAL + NORMAL: commits don't fsync (only checkpoints do). The database stays
+    # consistent and an agentd crash loses nothing; an OS crash or power loss can drop the
+    # last commits, which recover() treats like any restart. FULL would put one disk sync
+    # per worker event on the event loop, so a slow disk would stall every session.
+    conn.execute("pragma synchronous = NORMAL")
     return conn
+
+
+def connect_loop(path: Path) -> sqlite3.Connection:
+    """The event loop's connection: never checkpoints inline. Supervisor.checkpoint() does
+    it from a worker thread instead, so WAL syncs never block the loop."""
+    conn = connect(path)
+    conn.execute("pragma wal_autocheckpoint = 0")
+    return conn
+
+
+def checkpoint(path: Path) -> tuple[int, int, int]:
+    """Copy the WAL back into the database (PASSIVE: never blocks writers). Runs off the
+    event loop. Returns sqlite's (busy, wal_frames, checkpointed_frames)."""
+    conn = connect(path)
+    try:
+        return tuple(conn.execute("pragma wal_checkpoint(PASSIVE)").fetchone())
+    finally:
+        conn.close()
 
 
 # docs#24: bump SCHEMA_VERSION with every schema change and add MIGRATIONS[old] to take a

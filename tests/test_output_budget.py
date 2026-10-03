@@ -130,3 +130,20 @@ def test_retention_disabled_keeps_everything(settings, lobby, boostie):
         wait_status(c, sid, boostie)
         assert c.app.state.supervisor.prune_events() == 0
         assert events(c, sid, boostie)
+
+
+def test_event_writes_never_sync_the_disk_on_the_loop(client, settings, boostie):
+    """One fsync per worker event on the event loop would stall every session behind the
+    disk (seen on slow CI disks): the loop's connection doesn't sync commits or checkpoint
+    inline, and the cleanup loop checkpoints from a thread instead."""
+    import asyncio
+
+    conn = client.app.state.conn
+    assert conn.execute("pragma synchronous").fetchone()[0] == 1  # NORMAL
+    assert conn.execute("pragma wal_autocheckpoint").fetchone()[0] == 0
+    sid = spawn(client, boostie, "flood 300 100").json()["session_id"]
+    wait_status(client, sid, boostie)
+    wal = settings.db_path.with_name(settings.db_path.name + "-wal")
+    assert wal.stat().st_size > 0  # nothing checkpointed it inline
+    busy, frames, done = asyncio.run(client.app.state.supervisor.checkpoint())
+    assert busy == 0 and frames > 0 and done == frames
