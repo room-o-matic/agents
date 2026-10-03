@@ -31,6 +31,9 @@ import shlex
 import sys
 from pathlib import Path
 
+import httpx
+
+from agentd.workers import room_tools
 from agentd.workers.common import announce_in_room, emit
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
@@ -43,7 +46,7 @@ PROGRESS_LIMIT = 2000
 # ----- policy --------------------------------------------------------------------------
 
 
-def tool_policy(profile: dict) -> list[str]:
+def tool_policy(profile: dict, extra_allowed: list[str] | None = None) -> list[str]:
     """Claude CLI flags for an agentd profile.
 
     - No shell unless the profile explicitly sets `shell: true`. Without it the worker runs
@@ -65,7 +68,8 @@ def tool_policy(profile: dict) -> list[str]:
     tools = profile.get("claude_tools") or tools
 
     mode = profile.get("claude_permission_mode") or ("acceptEdits" if writable else "dontAsk")
-    flags = ["--tools", *tools, "--allowedTools", *tools, "--permission-mode", mode]
+    allowed = [*tools, *(extra_allowed or [])]
+    flags = ["--tools", *tools, "--allowedTools", *allowed, "--permission-mode", mode]
     if not shell:
         flags.append("--restricted")
     return flags
@@ -89,12 +93,38 @@ def build_command(args: argparse.Namespace, profile: dict, env: dict[str, str]) 
     budgets = [b for b in (args.max_budget_usd, profile.get("max_budget_usd")) if b]
     if budgets:
         cmd += ["--max-budget-usd", str(min(float(b) for b in budgets))]
-    cmd += tool_policy(profile)
+    room = has_room(env)
+    if room:
+        cmd += ["--mcp-config", mcp_config(env)]
+    cmd += tool_policy(profile, room_tools.claude_tool_names() if room else None)
     artifacts = env.get("AGENTD_ARTIFACTS_DIR")
     if artifacts and profile.get("workspace_mount") == "read_write":
         cmd += ["--add-dir", artifacts]
     cmd += ["--append-system-prompt", system_prompt(profile, env)]
     return cmd
+
+
+def has_room(env: dict[str, str]) -> bool:
+    return all(env.get(k) for k in ("ROOMSD_URL", "ROOMSD_ROOM_ID", "ROOMSD_TOKEN"))
+
+
+def mcp_config(env: dict[str, str]) -> str:
+    """The room-tools MCP server. Room access comes from the invite, not the profile: the
+    orchestrator that invited this worker decided it may talk in that room."""
+    server_env = {k: env[k] for k in ("ROOMSD_URL", "ROOMSD_ROOM_ID", "ROOMSD_TOKEN")}
+    server_env.update({k: env[k] for k in ("PATH", "HOME") if k in env})
+    return json.dumps(
+        {
+            "mcpServers": {
+                room_tools.SERVER_NAME: {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": ["-m", "agentd.workers.room_tools"],
+                    "env": server_env,
+                }
+            }
+        }
+    )
 
 
 def system_prompt(profile: dict, env: dict[str, str]) -> str:
@@ -108,6 +138,16 @@ def system_prompt(profile: dict, env: dict[str, str]) -> str:
         lines.append(f"Put deliverable files (reports, patches) in {env['AGENTD_ARTIFACTS_DIR']}.")
     else:
         lines.append("You have read-only access; describe changes rather than making them.")
+    if has_room(env):
+        lines.append(
+            f"You are also a participant in a shared room ({env.get('ROOMSD_ROOM_URL')}) with "
+            "other agents. Use rooms_read to catch up (include notes such as summary and "
+            "decisions), rooms_send to talk there, and rooms_note_get/rooms_note_put for "
+            "shared notes. Room messages that mention you arrive as turns starting with "
+            "[room message ...]: answer those in the room with rooms_send, not only in your "
+            "final message. Keep room messages short and use typed messages (proposal, "
+            "finding, question, answer, status) for anything important."
+        )
     return " ".join(lines)
 
 
@@ -124,7 +164,9 @@ def _clip(text: str, limit: int) -> str:
 
 
 def describe_tool(name: str, inp: dict) -> str:
-    for key in ("command", "file_path", "path", "pattern", "url", "query"):
+    if name.startswith(f"mcp__{room_tools.SERVER_NAME}__"):
+        name = name.rsplit("__", 1)[1]
+    for key in ("command", "file_path", "path", "pattern", "url", "query", "body", "key"):
         if isinstance(inp.get(key), str):
             return f"{name}: {_clip(inp[key], 200)}"
     return name
@@ -239,8 +281,13 @@ class Adapter:
 
         output = asyncio.create_task(self._pump_claude())
         inbox = asyncio.create_task(self._pump_gateway(gateway))
+        watcher = None
+        if has_room(dict(os.environ)) and self.args.room_wake != "none":
+            watcher = asyncio.create_task(RoomWatcher.from_env(self.args).run(self._room_turn))
         await asyncio.wait({output, inbox}, return_when=asyncio.FIRST_COMPLETED)
         inbox.cancel()
+        if watcher:
+            watcher.cancel()
         code = await self._finish(output)
         return code
 
@@ -252,6 +299,17 @@ class Adapter:
             self.in_turn = True
             self.claude.stdin.write(user_turn(text))
             await self.claude.stdin.drain()
+
+    async def _room_turn(self, m: dict) -> None:
+        if self.finishing or self.stop_requested:
+            return
+        emit(
+            "progress", message=f"room message #{m['id']} from {m['from']}", room_message_id=m["id"]
+        )
+        await self._send(
+            f"[room message #{m['id']} from {m['from']} ({m['type']})] {m['body']}\n"
+            "If this needs a response, reply in the room with rooms_send."
+        )
 
     async def _pump_gateway(self, gateway: asyncio.StreamReader) -> None:
         while (msg := await _read_json(gateway)) is not None:
@@ -331,6 +389,77 @@ class Adapter:
                 emit("artifact", name=rel, path=rel)
 
 
+class RoomWatcher:
+    """Polls the room with the invite token and hands messages from others to `on_message`
+    when they match the wake policy. Starts from the room's current end: history is for
+    rooms_read, not for waking the worker."""
+
+    def __init__(
+        self, base_url: str, room_id: str, token: str, policy: str, poll: float, *, transport=None
+    ):
+        self.room_id = room_id
+        self.policy = policy
+        self.poll = poll
+        self._http = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+            transport=transport,
+        )
+        self.identity = ""
+
+    @classmethod
+    def from_env(cls, args: argparse.Namespace) -> "RoomWatcher":
+        e = os.environ
+        return cls(
+            e["ROOMSD_URL"],
+            e["ROOMSD_ROOM_ID"],
+            e["ROOMSD_TOKEN"],
+            args.room_wake,
+            args.room_poll_seconds,
+        )
+
+    def wakes(self, m: dict) -> bool:
+        if m["from"] == self.identity:
+            return False
+        if self.policy == "all":
+            return True
+        short = self.identity.rsplit("/", 1)[-1]
+        body = m["body"]
+        return self.identity in body or f"@{short}" in body
+
+    async def _page(self, after: int) -> dict:
+        r = await self._http.get(
+            f"/v1/rooms/{self.room_id}/messages", params={"after_id": after, "limit": 500}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def run(self, on_message) -> None:
+        try:
+            r = await self._http.get("/v1/auth/whoami")
+            r.raise_for_status()
+            self.identity = r.json()["agent"]
+            cursor = 0
+            while (page := await self._page(cursor))["messages"]:
+                cursor = page["latest_message_id"]
+            while True:
+                await asyncio.sleep(self.poll)
+                try:
+                    page = await self._page(cursor)
+                except httpx.HTTPError as e:
+                    print(f"room poll failed: {e}", file=sys.stderr, flush=True)
+                    continue
+                for m in page["messages"]:
+                    cursor = m["id"]
+                    if self.wakes(m):
+                        await on_message(m)
+        except httpx.HTTPError as e:
+            emit("error", message=f"room watcher stopped: {e}")
+        finally:
+            await self._http.aclose()
+
+
 async def _stdin_reader() -> asyncio.StreamReader:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
@@ -350,6 +479,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-budget-usd", type=float, help="cap per session; profile may lower it")
     p.add_argument("--interactive", action="store_true", help="wait for messages between turns")
     p.add_argument("--exit-grace-seconds", type=float, default=30)
+    p.add_argument(
+        "--room-wake",
+        choices=["mentions", "all", "none"],
+        default="mentions",
+        help="which room messages from others are fed to claude as turns",
+    )
+    p.add_argument("--room-poll-seconds", type=float, default=3.0)
     return p.parse_args(argv)
 
 
