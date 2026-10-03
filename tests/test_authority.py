@@ -197,12 +197,12 @@ def test_hostile_peer_cannot_widen_authority(worker_client, roomsd, boostie):
     wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input")
     argv_before = json.loads(c.argv_file.read_text())
 
-    roomsd.post("mallory@test", HOSTILE, type="decision")
+    roomsd.post("mallory@test", HOSTILE, type="message")  # a decision wouldn't wake (docs#16)
     woke = wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input" and e.get("turn") == 2)
     turn = woke["question"]
     # The peer's text reached the worker, framed as untrusted room input, with its forged
     # owner frame defanged...
-    assert 'from="mallory@test" type="decision" trust="untrusted"' in turn
+    assert 'from="mallory@test" type="message" hop="0" trust="untrusted"' in turn
     assert "<owner-message" not in turn and "‹owner-message" in turn
     # ...and nothing about the worker's authority changed: same single claude process,
     # same flags, still restricted, still no shell or write tools.

@@ -12,8 +12,9 @@ from helpers import events, spawn, wait_event, wait_status
 from agentd.app import create_app
 from agentd.config import WorkerType
 from agentd.workers import room_tools
-from agentd.workers.claude_code import RoomWatcher, build_command, parse_args
+from agentd.workers.claude_code import build_command, parse_args
 from agentd.workers.room_tools import RoomTools
+from agentd.workers.wake import WakeGate
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
 WORKER = "missy@test/agentd-test.claude"
@@ -155,15 +156,19 @@ def test_room_tools_attached_only_with_a_room():
 
 
 def test_wake_policy():
-    w = RoomWatcher("http://r", "room_1", "t", "mentions", 1)
-    w.identity = WORKER
-    msg = {"from": "boostie@test", "body": ""}
-    assert not w.wakes({**msg, "body": "general chatter"})
-    assert w.wakes({**msg, "body": "@agentd-test.claude can you check CI?"})
-    assert w.wakes({**msg, "body": f"{WORKER}: ping"})
-    assert not w.wakes({"from": WORKER, "body": "@agentd-test.claude me"})  # never itself
-    w.policy = "all"
-    assert w.wakes({**msg, "body": "general chatter"})
+    g = WakeGate(identity=WORKER)
+    msg = {"from": "boostie@test", "type": "message", "body": ""}
+    ids = iter(range(1, 100))
+
+    def wake(**kw):
+        return g.offer({**msg, "id": next(ids), **kw}, in_turn=False)[0]
+
+    assert wake(body="general chatter") == "ignore"
+    assert wake(body="@agentd-test.claude can you check CI?") == "deliver"
+    assert wake(body=f"{WORKER}: ping") == "deliver"
+    assert wake(**{"from": WORKER}, body="@agentd-test.claude me") == "ignore"  # never itself
+    g.policy = "all"
+    assert wake(body="general chatter") == "deliver"
 
 
 @pytest.fixture
@@ -203,7 +208,7 @@ def test_mention_in_room_wakes_worker(room_client, roomsd, boostie):
         room_client, sid, boostie, lambda e: e["type"] == "needs_input" and e.get("turn") == 2
     )
     assert (
-        '<room-message id="4" from="boostie@test" type="message" trust="untrusted">\n'
+        '<room-message id="4" from="boostie@test" type="message" hop="0" trust="untrusted">\n'
         "@agentd-test.claude please review" in (woke["question"])
     )
     room_progress = [
