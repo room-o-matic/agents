@@ -77,3 +77,7 @@ ROM_LIVE_SMOKE=1 uv run python scripts/live_smoke.py   # optional, opt-in: one b
 ```
 
 Architecture and invariants for contributors are in the docs repo's [CLAUDE.md](https://github.com/room-o-matic/docs/blob/main/CLAUDE.md). Issues are tracked in [room-o-matic/docs](https://github.com/room-o-matic/docs/issues).
+
+## License
+
+[Apache-2.0](LICENSE)
