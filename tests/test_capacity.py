@@ -18,13 +18,13 @@ class BarrierBackend:
         self.started = 0
         self.release = threading.Event()
 
-    async def start(self, command, env, cwd):
+    async def start(self, command, env, cwd, spec=None):
         self.started += 1
         while not self.release.is_set():
             await asyncio.sleep(0.01)
         if self.fail:
             raise OSError("no such worker binary")
-        return await self.inner.start(command, env, cwd)
+        return await self.inner.start(command, env, cwd, spec)
 
 
 def gate(client, fail=False) -> BarrierBackend:

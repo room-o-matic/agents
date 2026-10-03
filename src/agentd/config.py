@@ -35,6 +35,47 @@ class WorkerType(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+class CallerPolicy(BaseModel):
+    """What one caller (a lobbyd principal, or "*") may run on this gateway (docs#9).
+
+    A lobbyd identity only proves who the caller is; this is the operator's opt-in that
+    lets them spend this host's capacity. Callers with no entry are refused.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    trust: Literal["trusted", "untrusted"] = Field(
+        default="untrusted",
+        description="untrusted callers only run on an isolating backend (sandbox)",
+    )
+    profiles: list[str] = Field(default_factory=list, description='allowed profiles; "*" = any')
+    worker_types: list[str] = Field(default_factory=list, description='allowed; "*" = any')
+    workspace_roots: list[Path] | None = Field(
+        default=None, description="narrower roots for this caller; null = the gateway's"
+    )
+    max_sessions: int = Field(default=1, ge=0, description="concurrent sessions for this caller")
+    max_budget_usd: float | None = Field(default=None, gt=0)
+
+    def allows(self, field: list[str], value: str) -> bool:
+        return "*" in field or value in field
+
+
+class SandboxSettings(BaseModel):
+    """bubblewrap isolation for untrusted hosted work (docs#9)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    bwrap: str = "bwrap"
+    ro_paths: list[Path] = Field(
+        default_factory=list,
+        description="extra host paths the worker may read (e.g. an agent CLI install)",
+    )
+    memory_bytes: int = Field(default=2 * 1024**3, ge=64 * 1024**2)
+    file_size_bytes: int = Field(default=512 * 1024**2, ge=1024**2)
+    cpu_seconds: int = Field(default=3600, ge=1)
+    open_files: int = Field(default=1024, ge=64)
+
+
 DEFAULT_PROFILES = {
     "read_only_research": Profile(
         max_runtime_minutes=30, workspace_mount="none", filesystem="read"
@@ -96,6 +137,17 @@ class Settings(BaseModel):
 
     profiles: dict[str, Profile] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     worker_types: dict[str, WorkerType] = Field(default_factory=lambda: dict(DEFAULT_WORKER_TYPES))
+
+    # Who may run what here (docs#9). Default deny: a caller needs an entry (or "*").
+    callers: dict[str, CallerPolicy] = Field(default_factory=dict)
+    callers_file: Path | None = Field(
+        default=None, description="YAML caller policy, re-read when it changes (revocation)"
+    )
+    backend: Literal["process", "sandbox"] = Field(
+        default="process",
+        description="process = no isolation, trusted callers only; sandbox = bubblewrap",
+    )
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
 
     # lobbyd: issuer of the access tokens callers present, and home of the agentd registry.
     lobbyd_url: str = "http://127.0.0.1:8767"

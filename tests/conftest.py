@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from agentd.app import create_app
-from agentd.config import Settings
+from agentd.config import CallerPolicy, Settings
 from agentd.verify import TokenVerifier
 
 ISSUER = "http://lobby.test"
@@ -65,6 +65,10 @@ def workspace_root(tmp_path):
 def settings(tmp_path, workspace_root) -> Settings:
     return Settings(
         instance_id="agentd-test",
+        # Local-dev style policy: everyone trusted on the process backend (docs#9).
+        callers={
+            "*": CallerPolicy(trust="trusted", profiles=["*"], worker_types=["*"], max_sessions=100)
+        },
         base_url=BASE_URL,
         lobbyd_url=ISSUER,
         lobbyd_domain=DOMAIN,

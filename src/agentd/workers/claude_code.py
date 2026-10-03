@@ -91,7 +91,8 @@ def build_command(args: argparse.Namespace, profile: dict, env: dict[str, str]) 
     ]
     if args.model:
         cmd += ["--model", args.model]
-    budgets = [b for b in (args.max_budget_usd, profile.get("max_budget_usd")) if b]
+    grant_budget = load_grant(env).get("max_budget_usd")
+    budgets = [b for b in (args.max_budget_usd, profile.get("max_budget_usd"), grant_budget) if b]
     if budgets:
         cmd += ["--max-budget-usd", str(min(float(b) for b in budgets))]
     room = has_room(env)
