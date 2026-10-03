@@ -25,7 +25,7 @@ from agentd.backends.process import (
     find_orphan,
     iter_lines,
 )
-from agentd.config import Profile, Settings
+from agentd.config import Profile, Settings, WorkerType
 from agentd.events import EventStore
 from agentd.ids import iso_in, new_id, now_iso
 from agentd.models import ACTIVE_STATUSES, RoomRef, SpawnRequest
@@ -76,6 +76,10 @@ class Supervisor:
             send_timeout=settings.send_timeout_seconds,
         )
         self._background: set[asyncio.Task] = set()
+        # Slots reserved by spawns that passed admission but aren't in _live yet. Taken
+        # synchronously at admission (no await in between) so concurrent spawns can't
+        # oversubscribe max_sessions (docs#4).
+        self._launching = 0
         self._live: dict[str, LiveSession] = {}
         # Set whenever active_count() changes, so the registry heartbeat can report promptly.
         self.capacity_changed = asyncio.Event()
@@ -83,7 +87,8 @@ class Supervisor:
     # ----- queries -------------------------------------------------------------------
 
     def active_count(self) -> int:
-        return len(self._live)
+        """Live sessions plus launches in progress: what admission and the registry see."""
+        return len(self._live) + self._launching
 
     def get_row(self, session_id: str) -> sqlite3.Row | None:
         return self.conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
@@ -149,9 +154,28 @@ class Supervisor:
             raise SpawnError(403, f"profile {req.profile!r} does not allow {req.worker_type!r}")
         workspace = self._resolve_workspace(req, profile)
         room = req.room
-        if len(self._live) >= s.max_sessions:
+        if self.active_count() >= s.max_sessions:
             raise SpawnError(429, f"instance at capacity ({s.max_sessions} active sessions)")
+        self._launching += 1
+        self.capacity_changed.set()
+        try:
+            return await self._launch(req, requester_agent, profile, worker, workspace, room)
+        finally:
+            self._launching -= 1
+            self.capacity_changed.set()
 
+    async def _launch(
+        self,
+        req: SpawnRequest,
+        requester_agent: str,
+        profile: Profile,
+        worker: WorkerType,
+        workspace: Path | None,
+        room: RoomRef | None,
+    ) -> sqlite3.Row:
+        """Everything after admission. Runs while holding a reserved slot; by the time it
+        returns the session is either in _live or terminal."""
+        s = self.settings
         # A caller timeout can only lower the profile's maximum.
         hard = profile.max_runtime_minutes * 60
         if req.timeout_seconds is not None:
@@ -207,16 +231,19 @@ class Supervisor:
         except OSError as e:
             self._set_terminal(session_id, "failed", f"worker failed to start: {e}")
             return self.get_row(session_id)
+        except BaseException:
+            # Cancelled mid-launch: never leave the row looking like it's starting.
+            self._set_terminal(session_id, "failed", "launch cancelled")
+            raise
 
         with self.conn:
             self.conn.execute("update sessions set pid = ? where id = ?", (handle.pid, session_id))
         live = LiveSession(session_id, handle, artifacts_dir, room)
-        self._live[session_id] = live
-        self.capacity_changed.set()
+        self._live[session_id] = live  # the reservation is released by spawn's finally
         live.tasks.append(asyncio.create_task(self._run(live), name=f"run-{session_id}"))
         try:
             await handle.send({"type": "task", "session_id": session_id, "task": req.task})
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, WorkerNotReading):
             pass  # The worker died immediately; _run records the failure.
         return self.get_row(session_id)
 
