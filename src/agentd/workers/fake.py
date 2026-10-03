@@ -8,6 +8,7 @@
     chatty N     print N plain log lines, then final
     badjson      emit malformed and reserved events, then final
     escape       emit an artifact whose path escapes the artifacts dir, then final
+    badfinal K   emit a final whose summary is a K (dict|list|number), then exit
     (anything)   progress, a log line, an artifact, final
 
 If ROOMSD_* env vars are set, it joins the room and posts a status message first, the
@@ -64,6 +65,11 @@ def main() -> int:
         print("AGENT_EVENT {not json", flush=True)
         emit("status", status="completed")  # reserved for the gateway
         emit("final", summary="survived bad output")
+        return 0
+    if mode == "badfinal":
+        emit("progress", message="about to send a malformed final")
+        bad = {"dict": {"not": "a string"}, "list": ["a", "b"], "number": 42}[arg or "dict"]
+        emit("final", summary=bad)
         return 0
     if mode == "escape":
         emit("artifact", name="passwd", path="../../../etc/passwd")

@@ -317,10 +317,20 @@ class Supervisor:
             status, reason = live.stop_status, live.stop_reason
         else:
             status, reason = "failed", f"worker exited with code {exit_code} without a final event"
-        self._set_terminal(sid, status, reason, exit_code=exit_code, summary=live.final_summary)
-        self._live.pop(sid, None)
-        self.capacity_changed.set()
-        live.finished.set()
+        try:
+            self._set_terminal(sid, status, reason, exit_code=exit_code, summary=live.final_summary)
+        except Exception as e:  # noqa: BLE001 - the session must still be released
+            log.exception("session %s: recording terminal status failed", sid)
+            status, reason = "failed", f"gateway error during finalization: {e}"
+            try:
+                self._set_terminal(sid, status, reason, exit_code=exit_code)
+            except Exception:  # noqa: BLE001
+                log.exception("session %s: recording failure status also failed", sid)
+        finally:
+            # Always release bookkeeping, or capacity leaks and stop()/shutdown() hang.
+            self._live.pop(sid, None)
+            self.capacity_changed.set()
+            live.finished.set()
         if live.room:
             await self._close_out_room(live, status, reason)
 
@@ -333,6 +343,8 @@ class Supervisor:
         exit_code: int | None = None,
         summary: str | None = None,
     ) -> None:
+        if not isinstance(summary, str):
+            summary = None  # protocol validation should have caught it; never bind non-text
         with self.conn:
             self.conn.execute(
                 "update sessions set status = ?, stop_reason = ?, stopped_at = ?,"
