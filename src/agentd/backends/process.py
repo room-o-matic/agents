@@ -14,9 +14,21 @@ from pathlib import Path
 from agentd.protocol import encode
 
 
+class WorkerNotReading(Exception):
+    """The worker isn't consuming stdin and its pending input is at the limit."""
+
+
 class ProcessHandle:
-    def __init__(self, proc: asyncio.subprocess.Process):
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        max_pending_bytes: int = 1024 * 1024,
+        send_timeout: float = 5.0,
+    ):
         self._proc = proc
+        self._max_pending = max_pending_bytes
+        self._send_timeout = send_timeout
 
     @property
     def pid(self) -> int:
@@ -30,12 +42,29 @@ class ProcessHandle:
     def stderr(self) -> asyncio.StreamReader:
         return self._proc.stderr
 
+    @property
+    def pgid(self) -> int:
+        # start_new_session=True makes the worker the leader of its own process group.
+        return self._proc.pid
+
     async def send(self, obj: dict) -> None:
+        """Queue a message for the worker without ever blocking for long.
+
+        Pending input is capped at max_pending_bytes (WorkerNotReading beyond that), and
+        drain() waits at most send_timeout: a message still buffered after that stays
+        queued and is delivered if the worker resumes reading.
+        """
         stdin = self._proc.stdin
         if stdin is None or stdin.is_closing():
             raise BrokenPipeError("worker stdin is closed")
-        stdin.write(encode(obj))
-        await stdin.drain()
+        data = encode(obj)
+        if stdin.transport.get_write_buffer_size() + len(data) > self._max_pending:
+            raise WorkerNotReading(f"worker has over {self._max_pending} bytes of unread input")
+        stdin.write(data)
+        try:
+            await asyncio.wait_for(stdin.drain(), self._send_timeout)
+        except TimeoutError:
+            pass
 
     def close_stdin(self) -> None:
         if self._proc.stdin and not self._proc.stdin.is_closing():
@@ -52,12 +81,30 @@ class ProcessHandle:
 
     def _signal(self, sig: int) -> None:
         try:
-            os.killpg(self._proc.pid, sig)
+            os.killpg(self.pgid, sig)
         except ProcessLookupError:
             pass
 
+    def group_alive(self) -> bool:
+        """Whether any process (leader or descendant) remains in the worker's group.
+
+        A descendant that calls setsid() leaves the group and escapes this; only a
+        container/cgroup backend can own those (see docs#3 and the Docker milestone).
+        """
+        try:
+            os.killpg(self.pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
 
 class ProcessBackend:
+    def __init__(self, *, max_pending_bytes: int = 1024 * 1024, send_timeout: float = 5.0):
+        self.max_pending_bytes = max_pending_bytes
+        self.send_timeout = send_timeout
+
     async def start(self, command: list[str], env: dict[str, str], cwd: Path) -> ProcessHandle:
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -68,7 +115,9 @@ class ProcessBackend:
             cwd=cwd,
             start_new_session=True,
         )
-        return ProcessHandle(proc)
+        return ProcessHandle(
+            proc, max_pending_bytes=self.max_pending_bytes, send_timeout=self.send_timeout
+        )
 
 
 async def iter_lines(reader: asyncio.StreamReader, max_bytes: int) -> AsyncIterator[str]:

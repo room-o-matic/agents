@@ -86,6 +86,10 @@ class Settings(BaseModel):
     default_idle_timeout_seconds: float = 600
     ready_timeout_seconds: float = 60
     stop_grace_seconds: float = 10
+    # Bounds on gateway -> worker stdin, so a worker that stops reading can't block
+    # messages, stop requests or cleanup (docs#3).
+    send_timeout_seconds: float = 5
+    max_pending_stdin_bytes: int = 1024 * 1024
     cleanup_interval_seconds: float = 30
     max_line_bytes: int = 64 * 1024
     max_log_bytes: int = 8 * 1024 * 1024
