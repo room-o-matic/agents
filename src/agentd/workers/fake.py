@@ -10,6 +10,8 @@
     escape       emit an artifact whose path escapes the artifacts dir, then final
     badfinal K   emit a final whose summary is a K (dict|list|number), then exit
     deaf         emit progress, then never read stdin again
+    probe F P    try hostile things (read file F, connect to 127.0.0.1:P, write the workspace,
+                 grab memory, leave a setsid'd descendant) and report what happened
     orphan [stubborn]  start a child in the same process group with stdio redirected
                  (ignoring SIGTERM if stubborn), report its pid, emit final, exit
     (anything)   progress, a log line, an artifact, final
@@ -30,6 +32,45 @@ from agentd.workers.common import announce_in_room, emit, read_msg
 def write_artifact(name: str, text: str) -> None:
     Path(os.environ["AGENTD_ARTIFACTS_DIR"], name).write_text(text)
     emit("artifact", name=name, path=name, mime_type="text/markdown")
+
+
+def probe(outside: str, port: str) -> dict:
+    import socket
+    import subprocess
+
+    def attempt(fn):
+        try:
+            fn()
+            return "ok"
+        except (OSError, MemoryError) as e:
+            return type(e).__name__
+
+    report = {
+        "read_outside": attempt(lambda: open(outside).read()),
+        "connect_host": attempt(
+            lambda: socket.create_connection(("127.0.0.1", int(port)), timeout=2).close()
+        ),
+        "home": os.path.expanduser("~"),
+        "home_entries": os.listdir(os.path.expanduser("~")),
+        "big_alloc": attempt(lambda: bytearray(4 * 1024**3)),
+    }
+    if ws := os.environ.get("AGENTD_WORKSPACE"):
+        report["write_workspace"] = attempt(lambda: Path(ws, "probe.txt").write_text("x"))
+    beat = Path(os.environ["AGENTD_ARTIFACTS_DIR"], "heartbeat")
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import time\nfor _ in range(600):\n"
+            f"    open({str(beat)!r}, 'a').write('.')\n    time.sleep(0.05)",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,  # setsid(): escapes the worker's process group
+    )
+    time.sleep(0.3)
+    return report
 
 
 def main() -> int:
@@ -72,6 +113,11 @@ def main() -> int:
     if mode == "deaf":
         emit("progress", message="not listening")
         time.sleep(3600)
+        return 0
+    if mode == "probe":
+        report = probe(*arg.split())
+        emit("progress", message="probe done", probe=report)
+        emit("final", summary="probed")
         return 0
     if mode == "orphan":
         import subprocess

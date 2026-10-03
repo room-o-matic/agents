@@ -11,6 +11,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: sandbox prerequisites (bubblewrap, unprivileged user namespaces)
+        run: |
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"

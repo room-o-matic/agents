@@ -25,10 +25,12 @@ from agentd.backends.process import (
     find_orphan,
     iter_lines,
 )
-from agentd.config import Profile, Settings, WorkerType
+from agentd.backends.sandbox import LaunchSpec, SandboxBackend
+from agentd.config import CallerPolicy, Profile, Settings, WorkerType
 from agentd.events import EventStore
 from agentd.ids import iso_in, new_id, now_iso
 from agentd.models import ACTIVE_STATUSES, RoomRef, SpawnRequest
+from agentd.policy import CallerPolicies, PolicyError, authorize, caller_workspace_ok
 from agentd.protocol import parse_stdout_line
 
 log = logging.getLogger("agentd.supervisor")
@@ -42,6 +44,7 @@ def task_grant(
     room: RoomRef | None,
     requester: str,
     expires_at: str,
+    caller: CallerPolicy | None = None,
 ) -> dict:
     """The immutable authority a session runs under (docs#8). Fixed at spawn from the
     server-side profile and the authenticated requester; nothing a worker reads later
@@ -59,7 +62,11 @@ def task_grant(
         "external_actions": profile.external_actions,
         "approval": "none",
         "expires_at": expires_at,
-        "max_budget_usd": extra.get("max_budget_usd"),
+        # The lower of the profile's and the caller's spend caps (docs#9).
+        "max_budget_usd": min(
+            (b for b in (extra.get("max_budget_usd"), caller and caller.max_budget_usd) if b),
+            default=None,
+        ),
         "room": (
             {"room_url": room.room_url, "reply": extra.get("room_reply", True) is not False}
             if room
@@ -105,20 +112,34 @@ class Supervisor:
         self.settings = settings
         self.conn = conn
         self.events = events
-        self.backend = backend or ProcessBackend(
-            max_pending_bytes=settings.max_pending_stdin_bytes,
-            send_timeout=settings.send_timeout_seconds,
-        )
+        limits = {
+            "max_pending_bytes": settings.max_pending_stdin_bytes,
+            "send_timeout": settings.send_timeout_seconds,
+        }
+        if backend is None and settings.backend == "sandbox":
+            backend = SandboxBackend(settings.sandbox, **limits)
+            backend.check()  # fail closed: no isolation available, no gateway
+        self.backend = backend or ProcessBackend(**limits)
         self._background: set[asyncio.Task] = set()
         # Slots reserved by spawns that passed admission but aren't in _live yet. Taken
         # synchronously at admission (no await in between) so concurrent spawns can't
         # oversubscribe max_sessions (docs#4).
         self._launching = 0
+        self._launching_by: dict[str, int] = {}
+        self.policies = CallerPolicies(settings)
         self._live: dict[str, LiveSession] = {}
         # Set whenever active_count() changes, so the registry heartbeat can report promptly.
         self.capacity_changed = asyncio.Event()
 
     # ----- queries -------------------------------------------------------------------
+
+    def _caller_active(self, principal: str) -> int:
+        live = sum(1 for sid in self._live if self._requester(sid) == principal)
+        return live + self._launching_by.get(principal, 0)
+
+    def _requester(self, session_id: str) -> str | None:
+        row = self.get_row(session_id)
+        return row["requester_agent"] if row else None
 
     def active_count(self) -> int:
         """Live sessions plus launches in progress: what admission and the registry see."""
@@ -153,6 +174,7 @@ class Supervisor:
         room: RoomRef | None,
         requester: str,
         expires_at: str,
+        caller: CallerPolicy,
     ) -> dict[str, str]:
         env = {k: os.environ[k] for k in self.settings.env_allowlist if k in os.environ}
         env.update(worker_env)
@@ -164,7 +186,14 @@ class Supervisor:
             AGENTD_ARTIFACTS_DIR=str(artifacts_dir),
             AGENTD_GRANT=json.dumps(
                 task_grant(
-                    session_id, profile_name, profile, workspace, room, requester, expires_at
+                    session_id,
+                    profile_name,
+                    profile,
+                    workspace,
+                    room,
+                    requester,
+                    expires_at,
+                    caller,
                 )
             ),
         )
@@ -193,16 +222,42 @@ class Supervisor:
             )
         if profile.worker_types is not None and req.worker_type not in profile.worker_types:
             raise SpawnError(403, f"profile {req.profile!r} does not allow {req.worker_type!r}")
+        if profile.external_actions == "approval_required":
+            # There is no approval transaction in this API, and approval is never inferred
+            # from a peer, task metadata or model output (docs#9): refuse rather than run.
+            raise SpawnError(
+                403, f"profile {req.profile!r} requires approval, which this gateway can't grant"
+            )
+        try:
+            caller = authorize(
+                self.policies.lookup(requester_agent),
+                principal=requester_agent,
+                profile_name=req.profile,
+                worker_type=req.worker_type,
+                backend=s.backend,
+            )
+        except PolicyError as e:
+            raise SpawnError(e.status_code, e.detail) from e
         workspace = self._resolve_workspace(req, profile)
+        if workspace is not None and not caller_workspace_ok(caller, workspace):
+            raise SpawnError(403, f"{requester_agent} may not use workspace {str(workspace)!r}")
         room = req.room
         if self.active_count() >= s.max_sessions:
             raise SpawnError(429, f"instance at capacity ({s.max_sessions} active sessions)")
+        if self._caller_active(requester_agent) >= caller.max_sessions:
+            raise SpawnError(
+                429, f"{requester_agent} is at its quota ({caller.max_sessions} sessions)"
+            )
         self._launching += 1
         self.capacity_changed.set()
         try:
-            return await self._launch(req, requester_agent, profile, worker, workspace, room)
+            self._launching_by[requester_agent] = self._launching_by.get(requester_agent, 0) + 1
+            return await self._launch(
+                req, requester_agent, profile, worker, workspace, room, caller
+            )
         finally:
             self._launching -= 1
+            self._launching_by[requester_agent] -= 1
             self.capacity_changed.set()
 
     async def _launch(
@@ -213,6 +268,7 @@ class Supervisor:
         worker: WorkerType,
         workspace: Path | None,
         room: RoomRef | None,
+        caller: CallerPolicy,
     ) -> sqlite3.Row:
         """Everything after admission. Runs while holding a reserved slot; by the time it
         returns the session is either in _live or terminal."""
@@ -275,9 +331,17 @@ class Supervisor:
             room,
             requester_agent,
             expires_at,
+            caller,
         )
         try:
-            handle = await self.backend.start(worker.command, env, workspace or scratch_dir)
+            spec = LaunchSpec(
+                scratch_dir=scratch_dir,
+                artifacts_dir=artifacts_dir,
+                workspace=workspace,
+                workspace_mode=profile.workspace_mount,
+                network=profile.network,
+            )
+            handle = await self.backend.start(worker.command, env, workspace or scratch_dir, spec)
         except OSError as e:
             self._set_terminal(session_id, "failed", f"worker failed to start: {e}")
             return self.get_row(session_id)

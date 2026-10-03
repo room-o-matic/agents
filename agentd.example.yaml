@@ -16,12 +16,23 @@ ready_timeout_seconds: 60          # worker must emit an AGENT_EVENT within this
 stop_grace_seconds: 10             # stop request -> SIGTERM -> SIGKILL spacing
 cleanup_interval_seconds: 30
 
+# Who may run work here (docs#9). Default deny: a lobbyd identity alone isn't enough.
+# "untrusted" callers only run on backend: sandbox. callers_file is re-read on change,
+# so removing an entry there revokes a caller without a restart.
+backend: process                   # process = no isolation (trusted callers only) | sandbox
+callers:
+  missy@local: {trust: trusted, profiles: [workspace_coder, read_only_research], worker_types: ["*"], max_sessions: 2}
+# callers_file: /etc/agentd/callers.yaml
+# sandbox:                         # bubblewrap; see agentd/backends/sandbox.py
+#   ro_paths: [/usr/local/lib/node_modules]   # e.g. an agent CLI install
+#   memory_bytes: 4294967296
+
 # Profiles are allowlists. Setting this key replaces the built-in set entirely.
 profiles:
   read_only_research: {max_runtime_minutes: 30, workspace_mount: none, filesystem: read}
   workspace_coder: {max_runtime_minutes: 120, workspace_mount: read_write, filesystem: workspace}
   discord_helper: {max_runtime_minutes: 45, filesystem: scratch, discord_send: false, discord_read: true}
-  dangerous_needs_approval:
+  dangerous_needs_approval:        # refused at launch: there is no approval mechanism yet
     max_runtime_minutes: 60
     workspace_mount: read_write
     filesystem: workspace

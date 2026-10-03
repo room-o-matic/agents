@@ -105,7 +105,11 @@ class ProcessBackend:
         self.max_pending_bytes = max_pending_bytes
         self.send_timeout = send_timeout
 
-    async def start(self, command: list[str], env: dict[str, str], cwd: Path) -> ProcessHandle:
+    async def start(
+        self, command: list[str], env: dict[str, str], cwd: Path, spec=None
+    ) -> ProcessHandle:
+        """Run `command` as a plain subprocess. `spec` (mount and network intent) is ignored:
+        this backend does not isolate, which is why it only takes trusted callers."""
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
