@@ -15,9 +15,11 @@ from agentd.config import Settings
 from agentd.events import EventStore
 from agentd.models import (
     ACTIVE_STATUSES,
+    Capabilities,
     InstanceInfo,
     MessageAccepted,
     MessageRequest,
+    Pair,
     Requester,
     Session,
     SpawnRequest,
@@ -63,6 +65,40 @@ def session_from_row(row: sqlite3.Row) -> Session:
         exit_code=row["exit_code"],
         summary=row["summary"],
         events_url=events_url(row["id"]),
+    )
+
+
+def capabilities(settings: Settings, caller) -> Capabilities:
+    pairs = [
+        Pair(profile=p, worker_type=w)
+        for p, prof in sorted(settings.profiles.items())
+        if prof.external_actions != "approval_required"  # refused at launch (docs#9)
+        for w in sorted(settings.worker_types)
+        if prof.worker_types is None or w in prof.worker_types
+    ]
+    allowed = [
+        pair
+        for pair in pairs
+        if caller is not None
+        and caller.allows(caller.profiles, pair.profile)
+        and caller.allows(caller.worker_types, pair.worker_type)
+        and (settings.backend == "sandbox" or caller.trust == "trusted")
+    ]
+    return Capabilities(
+        features=["operation_id", "sse_events", "room_invites", "task_grant", "caller_policy"],
+        pairs=pairs,
+        allowed_for_you=allowed,
+        limits={
+            "task_bytes": 64 * 1024,
+            "message_bytes": 64 * 1024,
+            "max_pending_stdin_bytes": settings.max_pending_stdin_bytes,
+            "max_sessions": settings.max_sessions,
+        },
+        cancellation=(
+            f"POST /stop: stop message, then SIGTERM after {settings.stop_grace_seconds}s, then"
+            " SIGKILL; ends 'stopped' (or 'completed' if the worker already sent final)"
+        ),
+        isolation="sandbox" if settings.backend == "sandbox" else "none",
     )
 
 
@@ -160,6 +196,7 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
             max_sessions=settings.max_sessions,
             active_sessions=sup(request).active_count(),
             registry_enabled=settings.registry_enabled,
+            capabilities=capabilities(settings, sup(request).policies.lookup(agent)),
         )
 
     @app.post("/v1/sessions", status_code=status.HTTP_201_CREATED)

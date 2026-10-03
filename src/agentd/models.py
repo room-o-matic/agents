@@ -108,6 +108,29 @@ class StopRequest(BaseModel):
     reason: str = Field(default="caller_cancelled", max_length=200)
 
 
+PROTOCOL = "room-o-matic.agentd/1"  # bump the major for incompatible changes (docs#15)
+
+
+class Pair(BaseModel):
+    profile: str
+    worker_type: str
+
+
+class Capabilities(BaseModel):
+    """What a client must check before minting an invite for this gateway (docs#15)."""
+
+    protocol: str = PROTOCOL
+    kind: Literal["gateway"] = Field(
+        default="gateway", description="spawns workers; a peer would be kind=peer (lobbyd)"
+    )
+    features: list[str]
+    pairs: list[Pair] = Field(description="profile/worker_type combinations this gateway runs")
+    allowed_for_you: list[Pair] = Field(description="the subset the calling principal may use")
+    limits: dict[str, int]
+    cancellation: str
+    isolation: Literal["none", "sandbox"]
+
+
 class InstanceInfo(BaseModel):
     instance_id: str
     base_url: str | None
@@ -116,3 +139,4 @@ class InstanceInfo(BaseModel):
     max_sessions: int
     active_sessions: int
     registry_enabled: bool
+    capabilities: Capabilities

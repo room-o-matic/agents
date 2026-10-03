@@ -13,6 +13,7 @@ from collections.abc import Callable
 import httpx
 
 from agentd.config import Settings
+from agentd.models import PROTOCOL
 
 log = logging.getLogger("agentd.lobby")
 
@@ -32,6 +33,13 @@ async def register(client: httpx.AsyncClient, settings: Settings, active_session
             "max_sessions": settings.max_sessions,
             "active_sessions": active_sessions,
             "ttl_seconds": settings.registry_ttl_seconds,
+            # docs#15: enough for discovery to rule out incompatible gateways early; the
+            # full contract is at GET /v1/instance.
+            "metadata": {
+                "protocol": PROTOCOL,
+                "kind": "gateway",
+                "isolation": "sandbox" if settings.backend == "sandbox" else "none",
+            },
         },
     )
     r.raise_for_status()
