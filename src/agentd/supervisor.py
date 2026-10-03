@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agentd import db
 from agentd.backends.process import (
     ProcessBackend,
     ProcessHandle,
@@ -754,6 +755,7 @@ class Supervisor:
         can't stall timeouts for every other session; retry owed room finalizations."""
         await self.finalizer.retry_due()
         self.prune_events()
+        await self.checkpoint()
         now = datetime.now(UTC)
         for sid, live in list(self._live.items()):
             if live.stop_status is not None:
@@ -765,6 +767,11 @@ class Supervisor:
             idle = (now - datetime.fromisoformat(row["last_activity_at"])).total_seconds()
             if idle >= row["idle_timeout_seconds"]:
                 self._stop_in_background(sid, "idle_timeout", "expired")
+
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """The loop's connection never checkpoints itself (db.connect_loop); do it here,
+        in a thread, so the WAL stays bounded without disk syncs on the event loop."""
+        return await asyncio.to_thread(db.checkpoint, self.settings.db_path)
 
     def prune_events(self) -> int:
         """Retention (docs#22): drop the event log of sessions that ended more than

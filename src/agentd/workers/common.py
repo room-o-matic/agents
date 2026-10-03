@@ -35,14 +35,29 @@ def _roomsd(method: str, path: str, body: dict | None = None) -> None:
     urllib.request.urlopen(req, timeout=10).read()
 
 
-def announce_in_room(what: str = "started") -> str | None:
-    """If invited into a room, join it and post a status message naming this session.
-    Returns the room id, or None when there is no room."""
+def join_room() -> str | None:
+    """If invited into a room, join it. Returns the room id, or None when there is no room
+    or joining failed (reported as an error event)."""
     room = os.environ.get("ROOMSD_ROOM_ID")
     if not room or not os.environ.get("ROOMSD_URL"):
         return None
     try:
         _roomsd("POST", f"/v1/rooms/{room}/participants")
+    except OSError as e:
+        emit("error", message=f"could not join room {room}: {e}")
+        return None
+    return room
+
+
+def announce_in_room(what: str = "started", join: bool = True) -> str | None:
+    """If invited into a room, join it (unless already joined) and post a status message
+    naming this session. Returns the room id, or None when there is no room."""
+    room = os.environ.get("ROOMSD_ROOM_ID")
+    if not room or not os.environ.get("ROOMSD_URL"):
+        return None
+    if join and join_room() is None:
+        return room
+    try:
         _roomsd(
             "POST",
             f"/v1/rooms/{room}/messages",

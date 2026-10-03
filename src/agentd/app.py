@@ -125,7 +125,7 @@ def create_app(settings: Settings | None = None, verifier: TokenVerifier | None 
         # docs#24: upgrades the schema (after a pre-upgrade backup) or refuses to start.
         db.init_db(settings.db_path, backup_dir=settings.backup_dir)
         settings.sessions_dir.mkdir(parents=True, exist_ok=True)
-        conn = db.connect(settings.db_path)
+        conn = db.connect_loop(settings.db_path)
         supervisor = Supervisor(settings, conn, EventStore(conn, settings.sessions_dir))
         supervisor.recover()
         app.state.conn = conn

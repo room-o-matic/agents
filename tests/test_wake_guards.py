@@ -161,3 +161,23 @@ def test_no_wakes_after_cancellation(worker, roomsd, boostie):
     roomsd.post("boostie@test", "@agentd-test.claude are you there?")
     time.sleep(0.3)
     assert len(events(c, sid, boostie)) == before  # a stopped session never wakes
+
+
+def test_mention_right_after_joining_wakes_the_worker(worker, roomsd, boostie):
+    """The wake cursor is fixed before the worker announces itself, so a mention sent the
+    moment it appears in the room (e.g. right after summon) isn't skipped as history."""
+    c = worker
+    sid = spawn(
+        c,
+        boostie,
+        "first",
+        worker_type="claude-chat",
+        room={"room_url": roomsd.room_url, "token": "inv_worker"},
+    ).json()["session_id"]
+    deadline = time.monotonic() + 10
+    while not any(m["from"] == ME for m in roomsd.messages):  # the join announcement
+        assert time.monotonic() < deadline, "worker never announced itself"
+        time.sleep(0.005)
+    roomsd.post("boostie@test", "@agentd-test.claude are you there?")
+    wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input" and e.get("turn") == 2)
+    c.post(f"/v1/sessions/{sid}/stop", headers=boostie)
