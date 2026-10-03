@@ -1,10 +1,10 @@
 # agentd config. Point AGENTD_CONFIG (or --config) at a copy of this file.
-# AGENTD_INSTANCE_ID, AGENTD_DATA_DIR, AGENTD_BASE_URL, AGENTD_ROOMSD_URL and
-# AGENTD_ROOMSD_TOKEN env vars override the matching keys.
+# AGENTD_<KEY> env vars (e.g. AGENTD_INSTANCE_ID, AGENTD_BASE_URL, AGENTD_LOBBYD_API_KEY)
+# override instance_id, data_dir, base_url and the lobbyd_* keys.
 
-instance_id: agentd-host1          # stable and unique; also this instance's roomsd identity
+instance_id: agentd-host1          # stable and unique; also its lobbyd key name
 data_dir: /var/lib/agentd
-base_url: http://host1:8765        # advertised in the roomsd registry
+base_url: http://host1:8765        # advertised in the registry; the audience callers' tokens need
 
 max_sessions: 4                    # concurrent active sessions; more get 429
 workspace_roots:                   # workspace paths must resolve under one of these
@@ -33,7 +33,9 @@ worker_types:
   fake:
     command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.fake]  # use absolute paths
 
-# roomsd registry: heartbeats are sent when roomsd_url, the token and base_url are all set.
-roomsd_url: http://127.0.0.1:8766
-# roomsd_token: set AGENTD_ROOMSD_TOKEN instead (an agentd-scope token from roomsd)
+# lobbyd: callers authenticate with lobbyd access tokens for this instance's base_url, and
+# the instance heartbeats into lobbyd's registry when lobbyd_api_key is set.
+lobbyd_url: http://127.0.0.1:8767
+lobbyd_domain: local
+# lobbyd_api_key: set AGENTD_LOBBYD_API_KEY instead (an agentd-scope key named instance_id)
 registry_ttl_seconds: 60

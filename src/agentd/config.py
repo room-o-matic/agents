@@ -68,8 +68,10 @@ class Settings(BaseModel):
 
     instance_id: str = Field(default_factory=default_instance_id, pattern=NAME_RE)
     data_dir: Path = Path("/var/lib/agentd")
-    base_url: str | None = Field(
-        default=None, description="URL other agents use to reach this instance"
+    base_url: str = Field(
+        default="http://127.0.0.1:8765",
+        description="URL other agents use to reach this instance; also the audience that "
+        "lobbyd access tokens for this instance must carry",
     )
 
     max_sessions: int = Field(default=4, ge=1, description="concurrent active sessions")
@@ -91,8 +93,13 @@ class Settings(BaseModel):
     profiles: dict[str, Profile] = Field(default_factory=lambda: dict(DEFAULT_PROFILES))
     worker_types: dict[str, WorkerType] = Field(default_factory=lambda: dict(DEFAULT_WORKER_TYPES))
 
-    roomsd_url: str | None = None
-    roomsd_token: str | None = Field(default=None, repr=False)
+    # lobbyd: issuer of the access tokens callers present, and home of the agentd registry.
+    lobbyd_url: str = "http://127.0.0.1:8767"
+    lobbyd_domain: str = "local"
+    lobbyd_jwks_url: str | None = None
+    # An agentd-scope lobbyd API key named `instance_id`. When set, this instance
+    # heartbeats into the lobbyd registry.
+    lobbyd_api_key: str | None = Field(default=None, repr=False)
     registry_ttl_seconds: int = Field(default=60, ge=5, le=600)
 
     @property
@@ -105,14 +112,22 @@ class Settings(BaseModel):
 
     @property
     def registry_enabled(self) -> bool:
-        return bool(self.roomsd_url and self.roomsd_token and self.base_url)
+        return bool(self.lobbyd_api_key)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Settings":
         """YAML config (path or $AGENTD_CONFIG), then AGENTD_* env overrides."""
         path = path or os.environ.get("AGENTD_CONFIG")
         data = (yaml.safe_load(Path(path).read_text()) or {}) if path else {}
-        for key in ("instance_id", "data_dir", "base_url", "roomsd_url", "roomsd_token"):
+        for key in (
+            "instance_id",
+            "data_dir",
+            "base_url",
+            "lobbyd_url",
+            "lobbyd_domain",
+            "lobbyd_jwks_url",
+            "lobbyd_api_key",
+        ):
             if value := os.environ.get(f"AGENTD_{key.upper()}"):
                 data[key] = value
         return cls(**data)

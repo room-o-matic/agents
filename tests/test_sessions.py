@@ -20,7 +20,7 @@ def test_spawn_runs_to_completion(client, boostie, settings):
     assert s["status"] == "completed"
     assert s["summary"] == "did: say hello"
     assert s["exit_code"] == 0
-    assert s["requester"]["agent"] == "boostie"
+    assert s["requester"]["agent"] == "boostie@test"
 
     evs = events(client, sid, boostie)
     statuses = [e["status"] for e in evs if e["type"] == "status"]
@@ -50,13 +50,18 @@ def test_follow_up_messages(client, boostie):
 
     r = client.post(f"/v1/sessions/{sid}/messages", json={"message": "hi"}, headers=boostie)
     assert r.json() == {"accepted": True, "status": "running"}
-    echo = wait_event(client, sid, boostie, lambda e: e.get("message") == "echo from boostie: hi")
+    echo = wait_event(
+        client, sid, boostie, lambda e: e.get("message") == "echo from boostie@test: hi"
+    )
     assert echo["type"] == "progress"
 
     client.post(f"/v1/sessions/{sid}/messages", json={"message": "done"}, headers=boostie)
     assert wait_status(client, sid, boostie)["status"] == "completed"
     sent = [e for e in events(client, sid, boostie) if e["type"] == "message"]
-    assert [(e["sender"], e["message"]) for e in sent] == [("boostie", "hi"), ("boostie", "done")]
+    assert [(e["sender"], e["message"]) for e in sent] == [
+        ("boostie@test", "hi"),
+        ("boostie@test", "done"),
+    ]
 
     r = client.post(f"/v1/sessions/{sid}/messages", json={"message": "late"}, headers=boostie)
     assert r.status_code == 409

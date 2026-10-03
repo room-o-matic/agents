@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 from helpers import spawn, wait_status
 
-from agentd import auth, db
+from agentd import db
 from agentd.app import create_app
 from agentd.config import DEFAULT_WORKER_TYPES, Profile, Settings
 from agentd.ids import now_iso
@@ -17,17 +17,25 @@ def test_requires_token(client):
     assert r.status_code == 401
 
 
+def test_rejects_tokens_for_other_audiences_and_scopes(client, lobby):
+    assert spawn(client, lobby.headers("boostie", aud="http://elsewhere.test")).status_code == 401
+    assert spawn(client, lobby.headers("boostie", ttl=-120)).status_code == 401
+    assert spawn(client, lobby.headers("agentd-x", scope="agentd")).status_code == 401
+
+
 def test_requester_identity_bound_to_token(client, boostie):
-    r = spawn(client, boostie, requester={"agent": "missy", "surface": "discord"})
+    r = spawn(client, boostie, requester={"agent": "missy@test", "surface": "discord"})
     assert r.status_code == 403
-    r = spawn(client, boostie, requester={"agent": "boostie", "surface": "discord"})
+    r = spawn(client, boostie, requester={"agent": "boostie@test", "surface": "discord"})
     assert r.status_code == 201
 
 
 def test_message_sender_bound_to_token(client, boostie):
     sid = spawn(client, boostie, "interactive").json()["session_id"]
     r = client.post(
-        f"/v1/sessions/{sid}/messages", json={"message": "x", "sender": "missy"}, headers=boostie
+        f"/v1/sessions/{sid}/messages",
+        json={"message": "x", "sender": "missy@test"},
+        headers=boostie,
     )
     assert r.status_code == 403
 
@@ -49,15 +57,17 @@ def test_unknown_profile_and_worker_type(client, boostie):
     assert spawn(client, boostie, worker_type="codex").status_code == 422
 
 
-def test_profile_worker_type_allowlist(tmp_path):
+def test_profile_worker_type_allowlist(tmp_path, lobby):
     settings = Settings(
         data_dir=tmp_path / "d2",
+        base_url="http://agentd.test",
+        lobbyd_url="http://lobby.test",
+        lobbyd_domain="test",
         profiles={"locked": Profile(max_runtime_minutes=1, worker_types=["other"])},
         worker_types=DEFAULT_WORKER_TYPES,
     )
-    with TestClient(create_app(settings)) as c:
-        headers = {"Authorization": "Bearer " + auth.create_token(c.app.state.conn, "boostie")}
-        assert spawn(c, headers, profile="locked").status_code == 403
+    with TestClient(create_app(settings, verifier=lobby.verifier())) as c:
+        assert spawn(c, lobby.headers("boostie"), profile="locked").status_code == 403
 
 
 def test_workspace_must_be_under_allowed_root(client, boostie, workspace_root, tmp_path):
@@ -117,7 +127,9 @@ def test_worker_env_is_allowlisted(client, boostie, monkeypatch, settings):
 
 
 def test_room_token_redacted_on_disk(client, boostie, settings):
-    r = spawn(client, boostie, room={"url": "http://127.0.0.1:1", "room_id": "r", "token": "s3"})
+    r = spawn(
+        client, boostie, room={"room_url": "http://127.0.0.1:1/v1/rooms/room_x", "token": "s3"}
+    )
     sid = r.json()["session_id"]
     wait_status(client, sid, boostie)
     assert "s3" not in (settings.sessions_dir / sid / "input.json").read_text()
@@ -141,3 +153,25 @@ def test_restart_fails_orphaned_sessions(settings):
     with TestClient(create_app(settings)) as c:
         row = c.app.state.conn.execute("select * from sessions where id = 'agt_old'").fetchone()
         assert (row["status"], row["stop_reason"]) == ("failed", "gateway_restarted")
+
+
+def test_room_url_parsed_into_worker_env(client, boostie):
+    room_url = "http://rooms-a.test/v1/rooms/room_01ABC"
+    r = spawn(client, boostie, "interactive", room={"room_url": room_url, "token": "rmsd_x"})
+    sid = r.json()["session_id"]
+    assert client.get(f"/v1/sessions/{sid}", headers=boostie).json()["room_url"] == room_url
+    pid = client.app.state.conn.execute("select pid from sessions where id = ?", (sid,)).fetchone()[
+        "pid"
+    ]
+    raw = open(f"/proc/{pid}/environ", "rb").read().decode().split("\0")
+    env = dict(kv.split("=", 1) for kv in raw if "=" in kv)
+    assert env["ROOMSD_URL"] == "http://rooms-a.test"
+    assert env["ROOMSD_ROOM_ID"] == "room_01ABC"
+    assert env["ROOMSD_ROOM_URL"] == room_url
+    assert env["ROOMSD_TOKEN"] == "rmsd_x"
+
+
+def test_bad_room_url_rejected(client, boostie):
+    for url in ["http://rooms-a.test/room_1", "rooms-a/v1/rooms/x", "http://a/v1/rooms/../x"]:
+        r = spawn(client, boostie, room={"room_url": url, "token": "t"})
+        assert r.status_code == 422, url

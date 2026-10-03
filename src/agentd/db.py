@@ -14,7 +14,7 @@ create table if not exists sessions (
   status text not null,
   task text not null,
   workspace_path text,
-  room_id text,
+  room_url text,
   pid integer,
   exit_code integer,
   idle_timeout_seconds real not null,
@@ -40,12 +40,6 @@ create table if not exists events (
 
 create index if not exists events_session_id_id on events(session_id, id);
 
-create table if not exists tokens (
-  token_hash text primary key,
-  agent text not null,
-  created_at text not null,
-  revoked_at text
-);
 """
 
 

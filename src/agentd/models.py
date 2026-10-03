@@ -1,3 +1,4 @@
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, JsonValue
@@ -17,12 +18,22 @@ class WorkspaceRequest(BaseModel):
     path: str
 
 
+ROOM_URL_RE = r"^(https?://[^\s]+?)/v1/rooms/([A-Za-z0-9_]{1,64})$"
+
+
 class RoomRef(BaseModel):
     """A roomsd room the worker should join, with the invite token minted for it."""
 
-    url: str | None = Field(default=None, description="roomsd base URL; defaults to config")
-    room_id: str = Field(max_length=64)
+    room_url: str = Field(pattern=ROOM_URL_RE, max_length=2048)
     token: str = Field(repr=False)
+
+    @property
+    def base_url(self) -> str:
+        return re.match(ROOM_URL_RE, self.room_url).group(1)
+
+    @property
+    def room_id(self) -> str:
+        return re.match(ROOM_URL_RE, self.room_url).group(2)
 
 
 class SpawnRequest(BaseModel):
@@ -55,7 +66,7 @@ class Session(BaseModel):
     worker_type: str
     task: str
     workspace_path: str | None
-    room_id: str | None
+    room_url: str | None
     created_at: str
     last_activity_at: str
     expires_at: str

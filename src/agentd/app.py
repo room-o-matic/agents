@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agentd import auth, db, rooms_client
+from agentd import db, lobby_client
 from agentd.config import Settings
 from agentd.events import EventStore
 from agentd.models import (
@@ -25,6 +25,7 @@ from agentd.models import (
     StopRequest,
 )
 from agentd.supervisor import SpawnError, Supervisor
+from agentd.verify import InvalidToken, TokenVerifier
 
 log = logging.getLogger("agentd")
 
@@ -53,7 +54,7 @@ def session_from_row(row: sqlite3.Row) -> Session:
         worker_type=row["worker_type"],
         task=row["task"],
         workspace_path=row["workspace_path"],
-        room_id=row["room_id"],
+        room_url=row["room_url"],
         created_at=row["created_at"],
         last_activity_at=row["last_activity_at"],
         expires_at=row["expires_at"],
@@ -65,8 +66,14 @@ def session_from_row(row: sqlite3.Row) -> Session:
     )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, verifier: TokenVerifier | None = None) -> FastAPI:
     settings = settings or Settings.load()
+    verifier = verifier or TokenVerifier(
+        issuer=settings.lobbyd_url,
+        domain=settings.lobbyd_domain,
+        audience=settings.base_url,
+        jwks_url=settings.lobbyd_jwks_url,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -81,7 +88,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.registry_enabled:
             tasks.append(
                 asyncio.create_task(
-                    rooms_client.heartbeat_loop(
+                    lobby_client.heartbeat_loop(
                         settings, supervisor.active_count, supervisor.capacity_changed
                     )
                 )
@@ -93,17 +100,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 t.cancel()
             await supervisor.shutdown()
             if settings.registry_enabled:
-                await rooms_client.deregister(settings)
+                await lobby_client.deregister(settings)
             conn.close()
 
     app = FastAPI(title="agentd", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
 
     async def current_agent(
-        request: Request,
         creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     ) -> str:
-        agent = auth.agent_for_token(request.app.state.conn, creds.credentials) if creds else None
+        """Callers present lobbyd access tokens for this instance; identity is name@domain."""
+        agent = None
+        if creds:
+            try:
+                # A thread, since a cache miss fetches the JWKS synchronously.
+                claims = await asyncio.to_thread(verifier.verify, creds.credentials)
+            except InvalidToken:
+                pass
+            else:
+                agent = claims.identity if claims.scope == "agent" else None
         if agent is None:
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,

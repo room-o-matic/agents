@@ -1,8 +1,9 @@
-"""agentd's side of the roomsd integration (see CLAUDE.md "Integration").
+"""agentd's outbound calls (see design/multi-server.md in the docs repo).
 
-- Registry: heartbeat this instance into roomsd so orchestrators can find it.
-- Rooms: when a session that was invited into a room ends, post a closing message with
-  the worker's invite token, then revoke that token so it dies with the session.
+- Registry: heartbeat this instance into the lobbyd directory so orchestrators find it.
+- Rooms: when a session that was invited into a room ends, post a closing message to
+  that room's roomsd with the worker's invite token, then revoke the token so it dies
+  with the session.
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import httpx
 
 from agentd.config import Settings
 
-log = logging.getLogger("agentd.rooms")
+log = logging.getLogger("agentd.lobby")
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -22,8 +23,8 @@ def _auth(token: str) -> dict[str, str]:
 
 async def register(client: httpx.AsyncClient, settings: Settings, active_sessions: int) -> None:
     r = await client.put(
-        f"{settings.roomsd_url}/v1/registry/agentd/{settings.instance_id}",
-        headers=_auth(settings.roomsd_token),
+        f"{settings.lobbyd_url}/v1/registry/agentd/{settings.instance_id}",
+        headers=_auth(settings.lobbyd_api_key),
         json={
             "base_url": settings.base_url,
             "worker_types": sorted(settings.worker_types),
@@ -47,7 +48,7 @@ async def heartbeat_loop(
             try:
                 await register(client, settings, active_sessions())
             except httpx.HTTPError as e:
-                log.warning("registry heartbeat to %s failed: %s", settings.roomsd_url, e)
+                log.warning("registry heartbeat to %s failed: %s", settings.lobbyd_url, e)
             try:
                 await asyncio.wait_for(changed.wait(), interval)
             except TimeoutError:
@@ -58,8 +59,8 @@ async def deregister(settings: Settings) -> None:
     async with httpx.AsyncClient(timeout=5) as client:
         try:
             await client.delete(
-                f"{settings.roomsd_url}/v1/registry/agentd/{settings.instance_id}",
-                headers=_auth(settings.roomsd_token),
+                f"{settings.lobbyd_url}/v1/registry/agentd/{settings.instance_id}",
+                headers=_auth(settings.lobbyd_api_key),
             )
         except httpx.HTTPError as e:
             log.warning("registry deregister failed: %s", e)

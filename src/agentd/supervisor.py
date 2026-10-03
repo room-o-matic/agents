@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from agentd import rooms_client
+from agentd import lobby_client
 from agentd.backends.process import ProcessBackend, ProcessHandle, find_orphan, iter_lines
 from agentd.config import Profile, Settings
 from agentd.events import EventStore
@@ -118,7 +118,10 @@ class Supervisor:
             )
         if room:
             env.update(
-                ROOMSD_URL=room.url or "", ROOMSD_ROOM_ID=room.room_id, ROOMSD_TOKEN=room.token
+                ROOMSD_URL=room.base_url,
+                ROOMSD_ROOM_ID=room.room_id,
+                ROOMSD_ROOM_URL=room.room_url,
+                ROOMSD_TOKEN=room.token,
             )
         return env
 
@@ -136,10 +139,6 @@ class Supervisor:
             raise SpawnError(403, f"profile {req.profile!r} does not allow {req.worker_type!r}")
         workspace = self._resolve_workspace(req, profile)
         room = req.room
-        if room is not None:
-            room = room.model_copy(update={"url": room.url or s.roomsd_url})
-            if not room.url:
-                raise SpawnError(422, "room.url is required (no roomsd_url configured)")
         if len(self._live) >= s.max_sessions:
             raise SpawnError(429, f"instance at capacity ({s.max_sessions} active sessions)")
 
@@ -166,7 +165,7 @@ class Supervisor:
             self.conn.execute(
                 "insert into sessions (id, instance_id, requester_agent, requester_surface,"
                 " requester_conversation_id, parent_session_id, profile, worker_type, status,"
-                " task, workspace_path, room_id, idle_timeout_seconds, created_at,"
+                " task, workspace_path, room_url, idle_timeout_seconds, created_at,"
                 " last_activity_at, expires_at, metadata_json)"
                 " values (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -180,7 +179,7 @@ class Supervisor:
                     req.worker_type,
                     req.task,
                     str(workspace) if workspace else None,
-                    room.room_id if room else None,
+                    room.room_url if room else None,
                     idle,
                     now,
                     now,
@@ -350,8 +349,8 @@ class Supervisor:
         if row["summary"]:
             body += f". Summary: {row['summary']}"
         try:
-            await rooms_client.close_out_room(
-                live.room.url,
+            await lobby_client.close_out_room(
+                live.room.base_url,
                 live.room.room_id,
                 live.room.token,
                 msg_type="handoff" if status == "completed" else "status",
