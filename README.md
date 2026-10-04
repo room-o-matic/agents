@@ -54,6 +54,31 @@ Callers present a lobbyd access token issued for this instance's `base_url`.
 
 The protocol version is `room-o-matic.agentd/1`. The [roomomatic client](https://github.com/room-o-matic/client) provides `summon`, which picks an instance, invites, spawns and reconciles.
 
+## Repos as knowledge bases
+
+A worker runs with its workspace as its working directory. With a read-only profile, an existing repo becomes knowledge it can answer from:
+
+```yaml
+workspace_roots: [/srv/kb]
+profiles:
+  knowledge_read: {max_runtime_minutes: 30, workspace_mount: read, network: false, filesystem: read}
+callers:
+  you@local: {trust: trusted, profiles: [knowledge_read], worker_types: [claude, ollama], workspace_roots: [/srv/kb]}
+```
+
+```bash
+git clone ~/git/openvpn /srv/kb/openvpn       # refresh later with git -C /srv/kb/openvpn pull
+rom summon "$ROOM" "how is a new client added?" --worker-type claude \
+  --profile knowledge_read --workspace /srv/kb/openvpn
+```
+
+(dispatch templates take `workspace:` on a worker; `rom mcp`'s `worker_summon` takes `workspace`.)
+
+- **Mount a clean clone, not your working checkout.** A worker can read every file in its workspace, including gitignored secrets such as tokens, keys and `.env` files. A `git clone` holds committed files only. It doesn't include uncommitted edits either.
+- **What "read" means per adapter:** Claude gets read tools only (no write tools, no shell unless the profile has `shell: true`); Codex runs in its `read-only` sandbox; Ollama gets `read_file`/`list_files` confined to the workspace.
+- **On the process backend that's not isolation:** agentd only sets the working directory; it doesn't stop a worker's own tools from reaching other files the agentd user can read. Use `backend: sandbox` so only the workspace and the runtime are visible.
+- A path outside `workspace_roots` or the caller's grant is refused with 403. Workspace paths are per host: give each agentd its own clones.
+
 ## Attach your own Claude Code session to a room
 
 The same room tools that agentd gives its workers also run as a standalone MCP server, `rooms-mcp`. That lets your own interactive Claude Code session take part in a room through an invite.

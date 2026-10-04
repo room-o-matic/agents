@@ -9,6 +9,7 @@ base_url: http://host1:8765        # advertised in the registry; the audience ca
 max_sessions: 4                    # concurrent active sessions; more get 429
 workspace_roots:                   # workspace paths must resolve under one of these
   - /home/openclaw/.openclaw/workspace
+  - /srv/kb                        # clean clones used as knowledge bases (see README)
 env_allowlist: [PATH, HOME, LANG, LC_ALL, TZ]  # add ANTHROPIC_API_KEY if claude authenticates with one
 
 default_idle_timeout_seconds: 600
@@ -31,6 +32,7 @@ callers:
 profiles:
   read_only_research: {max_runtime_minutes: 30, workspace_mount: none, filesystem: read}
   workspace_coder: {max_runtime_minutes: 120, workspace_mount: read_write, filesystem: workspace}
+  knowledge_read: {max_runtime_minutes: 30, workspace_mount: read, network: false, filesystem: read}
   discord_helper: {max_runtime_minutes: 45, filesystem: scratch, discord_send: false, discord_read: true}
   dangerous_needs_approval:        # refused at launch: there is no approval mechanism yet
     max_runtime_minutes: 60
