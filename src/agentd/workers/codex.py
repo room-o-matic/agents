@@ -34,26 +34,13 @@ the caller or the room:
 import argparse
 import asyncio
 import json
-import os
 import shlex
 import sys
-from pathlib import Path
-
-import httpx
 
 from agentd.workers import room_tools
-from agentd.workers.claude_code import (
-    CLOSING_PROMPT,
-    RoomWatcher,
-    frame_owner,
-    frame_room,
-    has_room,
-    load_grant,
-    room_reply_allowed,
-    system_prompt,
-)
-from agentd.workers.common import announce_in_room, emit, join_room, post_room_status
-from agentd.workers.wake import WakeGate
+from agentd.workers.claude_code import has_room, load_grant, room_reply_allowed, system_prompt
+from agentd.workers.common import emit
+from agentd.workers.turns import TurnAdapter, add_session_args, token_budget
 
 SUMMARY_LIMIT = 4000
 PROGRESS_LIMIT = 2000
@@ -116,11 +103,6 @@ def room_server_flags(env: dict[str, str]) -> list[str]:
         "-c",
         f'{server}.default_tools_approval_mode="approve"',
     ]
-
-
-def token_budget(args: argparse.Namespace, profile: dict) -> int | None:
-    caps = [c for c in (args.max_total_tokens, profile.get("max_total_tokens")) if c]
-    return min(int(c) for c in caps) if caps else None
 
 
 def build_command(
@@ -309,31 +291,26 @@ class Translator:
 # ----- the adapter process -------------------------------------------------------------
 
 
-class Adapter:
+class Adapter(TurnAdapter):
+    """One `codex exec` process per turn; the session loop is TurnAdapter's."""
+
+    name = "codex"
+
     def __init__(self, args: argparse.Namespace):
-        self.args = args
-        self.translator = Translator(args.model)
-        self.env = dict(os.environ)
-        self.profile = json.loads(self.env.get("AGENTD_PROFILE") or "{}")
-        self.cwd = os.getcwd()
-        self.budget = token_budget(args, self.profile)
-        self.inbox: asyncio.Queue[str] = asyncio.Queue()
+        super().__init__(args, Translator(args.model))
         self.proc: asyncio.subprocess.Process | None = None
-        self.in_turn = False
-        self.stop_requested = False
-        self.interrupted = False  # a stop arrived mid-turn: no closing summary
-        self.turn_timed_out = False  # the last turn ran past --max-turn-seconds
-        self.finishing = False
-        self.watcher: RoomWatcher | None = None
-        self.gate: WakeGate | None = None
-        self.preamble = system_prompt(self.profile, self.env)
 
-    # ----- one turn = one codex process --------------------------------------------
+    def first_prompt(self, task: str) -> str:
+        # Codex has no system-prompt flag: agentd's rules ride on the first turn.
+        preamble = system_prompt(self.profile, self.env)
+        return f"<session-instructions>\n{preamble}\n</session-instructions>\n\n{task}"
 
-    async def _turn(self, prompt: str, timeout: float | None = None, quiet: bool = False) -> bool:
-        t = self.translator
-        t.start_turn()
-        cmd = build_command(self.args, self.profile, self.env, self.cwd, t.thread_id)
+    def interrupt(self) -> None:
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
+
+    async def run_turn(self, prompt: str) -> str | None:
+        cmd = build_command(self.args, self.profile, self.env, self.cwd, self.state.thread_id)
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -343,36 +320,19 @@ class Adapter:
                 limit=16 * 1024 * 1024,
             )
         except OSError as e:
-            emit("error", message=f"cannot start codex ({shlex.split(self.args.codex)[0]}): {e}")
-            return False
-        self.in_turn = True
+            return f"cannot start codex ({shlex.split(self.args.codex)[0]}): {e}"
         try:
             self.proc.stdin.write(prompt.encode())
             await self.proc.stdin.drain()
             self.proc.stdin.close()
-            await asyncio.wait_for(self._pump(self.proc), timeout)
-        except TimeoutError:
-            self.proc.terminate()
-            if quiet:
-                emit("progress", message="codex turn timed out")
-            else:
-                # A turn that never ends (e.g. polling the room for messages) would also
-                # keep every later message and mention queued behind it.
-                self.turn_timed_out = True
-                emit(
-                    "error",
-                    message=f"codex turn ran over {timeout:g}s and was stopped; a turn must "
-                    "end rather than wait for messages",
-                )
-            quiet = True
+            await self._pump(self.proc)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except asyncio.CancelledError:
+            self.interrupt()
+            raise
         code = await self.proc.wait()
-        self.in_turn = False
-        if not t.turn_done and not self.stop_requested and not quiet:
-            emit("error", message=f"codex exited with code {code} before finishing the turn")
-            t.last_ok = False
-        return t.turn_done and t.last_ok
+        return f"codex exited with code {code} before finishing the turn"
 
     async def _pump(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout
@@ -382,253 +342,27 @@ class Adapter:
             except json.JSONDecodeError:
                 print(line.decode(errors="replace").rstrip(), file=sys.stderr, flush=True)
                 continue
-            for kind, fields in self.translator.handle(msg):
+            for kind, fields in self.state.handle(msg):
                 emit(kind, **fields)
-
-    def _write_result_artifact(self) -> None:
-        text = self.translator.last_result
-        artifacts = self.env.get("AGENTD_ARTIFACTS_DIR")
-        if text and artifacts:
-            Path(artifacts, "result.md").write_text(text)
-            emit("artifact", name="result.md", path="result.md", mime_type="text/markdown")
-
-    def _over_budget(self) -> bool:
-        if self.budget and self.translator.total_tokens >= self.budget:
-            emit(
-                "progress",
-                message=f"token budget reached ({self.translator.total_tokens} of "
-                f"{self.budget}); ending the session",
-                usage=dict(self.translator.usage),
-            )
-            return True
-        return False
-
-    # ----- input: owner messages, room wakes, stop -----------------------------------
-
-    async def _pump_gateway(self, gateway: asyncio.StreamReader) -> None:
-        while (line := await gateway.readline()) and not self.stop_requested:
-            msg = json.loads(line)
-            if msg.get("type") == "message":
-                await self._enqueue(frame_owner(msg.get("sender"), msg.get("message")))
-            elif msg.get("type") == "stop":
-                break
-        self.stop_requested = True
-        if self.in_turn and self.proc and self.proc.returncode is None:
-            self.interrupted = True
-            self.proc.terminate()  # don't wait for the turn to finish
-        await self.inbox.put("")  # wake the main loop
-
-    async def _enqueue(self, text: str) -> None:
-        if self.finishing:
-            emit("progress", message="message arrived after the task finished; not delivered")
-            return
-        await self.inbox.put(text)
-
-    def _gate(self) -> WakeGate:
-        if self.gate is None:
-            self.gate = WakeGate(
-                identity=self.watcher.identity,
-                policy=self.args.room_wake,
-                max_hop=self.args.room_max_hop,
-                max_wakes=self.args.room_max_wakes,
-                max_queue=self.args.room_max_queue,
-            )
-        return self.gate
-
-    async def _room_turn(self, m: dict) -> None:
-        if self.finishing or self.stop_requested:
-            return
-        gate = self._gate()
-        action, reason = gate.offer(m, in_turn=self.in_turn or not self.inbox.empty())
-        if action == "deliver":
-            emit(
-                "progress",
-                message=f"room message #{m['id']} from {m['from']}",
-                room_message_id=m["id"],
-            )
-            await self._enqueue(frame_room(m))
-        elif action == "queue":
-            emit("progress", message=f"queued room message #{m['id']}", room_message_id=m["id"])
-        elif action == "suppress":
-            emit(
-                "progress",
-                message=f"room wake suppressed ({reason})",
-                room_wake_suppressed={"reason": reason, "count": gate.suppressed[reason]},
-                room_message_id=m["id"],
-            )
-            if reason == "wake_budget_exhausted" and gate.suppressed[reason] == 1:
-                post_room_status(
-                    "wake budget exhausted: I'll stop responding to room messages in this "
-                    "session; my owner can stop or re-summon me."
-                )
-
-    def _drain_room_queue(self) -> str | None:
-        if self.gate is None:
-            return None
-        batch = self.gate.drain()
-        if not batch:
-            return None
-        emit(
-            "progress",
-            message=f"coalesced {len(batch)} room messages into one turn",
-            room_message_ids=[m["id"] for m in batch],
-        )
-        return "\n\n".join(frame_room(m) for m in batch)
-
-    def _pending(self) -> list[str]:
-        texts = []
-        while not self.inbox.empty():
-            if text := self.inbox.get_nowait():
-                texts.append(text)
-        if queued := self._drain_room_queue():
-            texts.append(queued)
-        return texts
-
-    # ----- the session ---------------------------------------------------------------
-
-    async def run(self) -> int:
-        emit("progress", message="starting codex")
-        gateway = await _stdin_reader()
-        first = await _read_json(gateway)
-        if not first or first.get("type") != "task":
-            emit("error", message="expected a task message first")
-            return 2
-        # Join, fix where room wakes start, then announce (see the Claude adapter).
-        if join_room() is not None and self.args.room_wake != "none":
-            self.watcher = RoomWatcher.from_env(self.args)
-            try:
-                await self.watcher.start()
-            except httpx.HTTPError as e:
-                emit("error", message=f"room watcher stopped: {e}")
-                self.watcher = None
-        announce_in_room(join=False)
-
-        inbox = asyncio.create_task(self._pump_gateway(gateway))
-        watcher = asyncio.create_task(self.watcher.run(self._room_turn)) if self.watcher else None
-        try:
-            return await self._session(first["task"])
-        finally:
-            inbox.cancel()
-            if watcher:
-                watcher.cancel()
-            self._report_new_artifacts()
-
-    async def _session(self, task: str) -> int:
-        t = self.translator
-        prompt = f"<session-instructions>\n{self.preamble}\n</session-instructions>\n\n{task}"
-        while True:
-            self.turn_timed_out = False
-            ok = await self._turn(prompt, timeout=self.args.max_turn_seconds or None)
-            if ok:
-                self._write_result_artifact()
-            if self.stop_requested:
-                break
-            if not ok and not (self.turn_timed_out and self.args.interactive):
-                return 1  # the error is reported; agentd marks the session failed
-            if self._over_budget():
-                break
-            pending = self._pending()
-            if pending:  # messages that arrived during the turn: answer them first
-                prompt = "\n\n".join(pending)
-                continue
-            if not self.args.interactive:
-                break
-            emit("needs_input", question=t.result_fields()["summary"], turn=t.turns)
-            text = await self.inbox.get()
-            if self.stop_requested or not text:
-                break
-            prompt = "\n\n".join([text, *self._pending()])
-        self.finishing = True
-        if self.stop_requested and self._wants_closing_summary():
-            before = (t.last_result, t.last_ok)
-            emit("progress", message="writing a closing summary for the handoff")
-            self.stop_requested = False  # let this one turn run
-            ok = await self._turn(
-                CLOSING_PROMPT, timeout=self.args.closing_summary_seconds, quiet=True
-            )
-            self.stop_requested = True
-            if not ok:
-                t.last_result, t.last_ok = before
-        if t.last_result is None:
-            return 0 if self.stop_requested else 1
-        emit("final", **t.result_fields())
-        return 0
-
-    def _wants_closing_summary(self) -> bool:
-        return (
-            self.args.interactive
-            and not self.interrupted
-            and self.args.closing_summary_seconds > 0
-            and self.translator.last_ok
-            and self.translator.turns > 0
-            and not self._over_budget_silent()
-        )
-
-    def _over_budget_silent(self) -> bool:
-        return bool(self.budget and self.translator.total_tokens >= self.budget)
-
-    def _report_new_artifacts(self) -> None:
-        artifacts = self.env.get("AGENTD_ARTIFACTS_DIR")
-        if not artifacts:
-            return
-        root = Path(artifacts)
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
-            rel = str(path.relative_to(root))
-            if rel != "result.md":
-                emit("artifact", name=rel, path=rel)
-
-
-async def _stdin_reader() -> asyncio.StreamReader:
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    return reader
-
-
-async def _read_json(reader: asyncio.StreamReader) -> dict | None:
-    line = await reader.readline()
-    return json.loads(line) if line else None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="agentd.workers.codex")
     p.add_argument("--codex", default="codex", help="codex command (shell-split)")
-    p.add_argument("--model")
-    p.add_argument(
-        "--max-total-tokens",
-        type=int,
-        help="uncached input + output tokens per session; profile may lower it",
-    )
-    p.add_argument("--interactive", action="store_true", help="wait for messages between turns")
     p.add_argument(
         "--external-sandbox",
         action="store_true",
         help="only with agentd's sandbox backend: skip Codex's own sandbox, which can't nest",
     )
-    p.add_argument(
-        "--max-turn-seconds",
-        type=float,
-        default=600,
-        help="stop a turn that runs longer (0 = no limit); interactive sessions keep going",
-    )
-    p.add_argument(
-        "--closing-summary-seconds",
-        type=float,
-        default=8,
-        help="interactive: on stop, give codex this long to write the room handoff (0 = off);"
-        " keep it under the gateway's stop_grace_seconds",
-    )
-    p.add_argument("--room-wake", choices=["mentions", "all", "none"], default="mentions")
-    p.add_argument("--room-poll-seconds", type=float, default=3.0)
-    p.add_argument("--room-max-hop", type=int, default=3)
-    p.add_argument("--room-max-wakes", type=int, default=10)
-    p.add_argument("--room-max-queue", type=int, default=20)
+    add_session_args(p, max_turn_seconds=600)
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     return asyncio.run(Adapter(parse_args(argv)).run())
 
+
+__all__ = ["Adapter", "Translator", "build_command", "parse_args", "token_budget"]
 
 if __name__ == "__main__":
     sys.exit(main())
