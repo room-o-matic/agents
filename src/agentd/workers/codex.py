@@ -322,6 +322,7 @@ class Adapter:
         self.in_turn = False
         self.stop_requested = False
         self.interrupted = False  # a stop arrived mid-turn: no closing summary
+        self.turn_timed_out = False  # the last turn ran past --max-turn-seconds
         self.finishing = False
         self.watcher: RoomWatcher | None = None
         self.gate: WakeGate | None = None
@@ -352,8 +353,18 @@ class Adapter:
             await asyncio.wait_for(self._pump(self.proc), timeout)
         except TimeoutError:
             self.proc.terminate()
+            if quiet:
+                emit("progress", message="codex turn timed out")
+            else:
+                # A turn that never ends (e.g. polling the room for messages) would also
+                # keep every later message and mention queued behind it.
+                self.turn_timed_out = True
+                emit(
+                    "error",
+                    message=f"codex turn ran over {timeout:g}s and was stopped; a turn must "
+                    "end rather than wait for messages",
+                )
             quiet = True
-            emit("progress", message="codex turn timed out")
         except (BrokenPipeError, ConnectionResetError):
             pass
         code = await self.proc.wait()
@@ -506,12 +517,13 @@ class Adapter:
         t = self.translator
         prompt = f"<session-instructions>\n{self.preamble}\n</session-instructions>\n\n{task}"
         while True:
-            ok = await self._turn(prompt)
+            self.turn_timed_out = False
+            ok = await self._turn(prompt, timeout=self.args.max_turn_seconds or None)
             if ok:
                 self._write_result_artifact()
             if self.stop_requested:
                 break
-            if not ok:
+            if not ok and not (self.turn_timed_out and self.args.interactive):
                 return 1  # the error is reported; agentd marks the session failed
             if self._over_budget():
                 break
@@ -592,6 +604,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--external-sandbox",
         action="store_true",
         help="only with agentd's sandbox backend: skip Codex's own sandbox, which can't nest",
+    )
+    p.add_argument(
+        "--max-turn-seconds",
+        type=float,
+        default=600,
+        help="stop a turn that runs longer (0 = no limit); interactive sessions keep going",
     )
     p.add_argument(
         "--closing-summary-seconds",

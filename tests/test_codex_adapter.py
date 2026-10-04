@@ -213,6 +213,12 @@ def codex_client(settings, lobby, tmp_path):
                     command=[*base, "--interactive", "--closing-summary-seconds", "0.5"],
                     env={**env, "FAKE_CODEX_HANG_ON_CLOSE": "1"},
                 ),
+                "codex-chat-turn-limit": WorkerType(
+                    command=[*base, "--interactive", "--max-turn-seconds", "0.5"], env=env
+                ),
+                "codex-turn-limit": WorkerType(
+                    command=[*base, "--max-turn-seconds", "0.5"], env=env
+                ),
                 "codex-missing": WorkerType(
                     command=[
                         sys.executable,
@@ -367,3 +373,38 @@ def test_room_mention_wakes_a_resumed_turn(codex_client, roomsd, boostie):
     c.post(f"/v1/sessions/{sid}/stop", headers=boostie)
     wait_event(c, sid, boostie, lambda e: e["type"] == "room_finalization")
     assert any(m["type"] == "handoff" for m in roomsd.messages)
+
+
+# ----- turns must end (live trio test: told to "wait", Codex polled inside its turn) --------
+
+
+def test_instructions_forbid_waiting_inside_a_turn():
+    from agentd.workers.claude_code import system_prompt
+
+    assert "Never wait or poll for new messages inside a turn" in system_prompt({}, {})
+
+
+def test_first_turn_carries_the_rule(codex_client, boostie):
+    c = codex_client
+    sid = spawn(c, boostie, "hello", worker_type="codex").json()["session_id"]
+    wait_status(c, sid, boostie)
+    assert "Never wait or poll for new messages inside a turn" in c.calls()[0]["prompt"]
+
+
+def test_runaway_turn_is_stopped_and_the_session_keeps_listening(codex_client, boostie):
+    c = codex_client
+    sid = spawn(c, boostie, "hang", worker_type="codex-chat-turn-limit").json()["session_id"]
+    ev = wait_event(c, sid, boostie, lambda e: e["type"] == "error")
+    assert "ran over 0.5s" in ev["message"]
+    wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input")
+    c.post(f"/v1/sessions/{sid}/messages", json={"message": "are you there?"}, headers=boostie)
+    wait_event(c, sid, boostie, lambda e: e["type"] == "needs_input" and e.get("turn") == 1)
+    s = c.post(f"/v1/sessions/{sid}/stop", headers=boostie).json()
+    assert s["status"] == "completed"
+    assert "are you there?" in c.calls()[1]["prompt"]
+
+
+def test_runaway_oneshot_turn_fails_the_session(codex_client, boostie):
+    c = codex_client
+    sid = spawn(c, boostie, "hang", worker_type="codex-turn-limit").json()["session_id"]
+    assert wait_status(c, sid, boostie)["status"] == "failed"
