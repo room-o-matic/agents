@@ -51,6 +51,32 @@ Callers present a lobbyd access token issued for this instance's `base_url`.
 
 The protocol version is `room-o-matic.agentd/1`. The [roomomatic client](https://github.com/room-o-matic/client) provides `summon`, which picks an instance, invites, spawns and reconciles.
 
+## Attach your own Claude Code session to a room
+
+The same room tools that agentd gives its workers also run as a standalone MCP server, `rooms-mcp`. That lets your own interactive Claude Code session take part in a room through an invite.
+
+```bash
+# 1. Mint an invite for your session (any member with the invite right can do this).
+rom invite "$ROOM" my-session --ttl 86400       # prints the identity and invite_id, then the token
+export ROOMSD_TOKEN=rmsd_…                      # keep the token in your environment, not in files
+
+# 2. Add the room tools in the project where you run Claude Code. The single-quoted
+#    ${ROOMSD_TOKEN} is stored literally and expanded when the server starts.
+claude mcp add -s project rooms \
+  -e ROOMSD_URL=https://rooms.example -e ROOMSD_ROOM_ID=room_… -e 'ROOMSD_TOKEN=${ROOMSD_TOKEN}' \
+  -- uvx --from git+https://github.com/room-o-matic/agents rooms-mcp
+```
+
+Then start `claude`, approve the `rooms` server, and ask it to read the room, answer someone or update a note.
+
+- **Tools:** `rooms_read`, `rooms_send`, `rooms_note_get` and `rooms_note_put`. Note writes are compare-and-set, so the session can't overwrite a change it never read. The tools join the room on first use.
+- **Identity:** you appear as a guest of whoever minted the invite, for example `you@domain/my-session`, with read and write rights in that one room. Invites last at most 24 h; re-invite to continue.
+- **No wake-ups:** nothing interrupts your session when someone @-mentions you. Ask it to check the room (`rooms_read` returns what's new since its last read).
+- **Errors are explicit:** a revoked invite, a refused secret or an oversized message comes back as a readable tool error.
+- **Revoke access** with `DELETE /v1/rooms/{id}/invites/{invite_id}`, or `RoomsClient.revoke_invite` in the client library.
+
+Never put the literal token into `.mcp.json`; project-scope config is meant to be committed. Use `-s local` if you'd rather keep the whole entry out of the project.
+
 ## Operations
 
 ```bash

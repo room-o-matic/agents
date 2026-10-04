@@ -22,6 +22,9 @@ Issues = "https://github.com/room-o-matic/docs/issues"
 
 [project.scripts]
 agentd = "agentd.cli:main"
+# The room tools as a standalone MCP server, for attaching your own Claude Code session to
+# a room with an invite (see README).
+rooms-mcp = "agentd.workers.room_tools:main"
 
 [dependency-groups]
 dev = [
