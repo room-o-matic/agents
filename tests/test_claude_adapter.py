@@ -8,6 +8,7 @@ from helpers import events, spawn, wait_event, wait_status
 
 from agentd.app import create_app
 from agentd.config import DEFAULT_PROFILES, Profile, WorkerType
+from agentd.workers import claude_code
 from agentd.workers.claude_code import Translator, build_command, parse_args, tool_policy
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
@@ -121,6 +122,13 @@ def claude_client(settings, lobby, tmp_path):
             "worker_types": {
                 "claude": WorkerType(command=base, env=env),
                 "claude-chat": WorkerType(command=[*base, "--interactive"], env=env),
+                "claude-chat-no-summary": WorkerType(
+                    command=[*base, "--interactive", "--closing-summary-seconds", "0"], env=env
+                ),
+                "claude-chat-slow-close": WorkerType(
+                    command=[*base, "--interactive", "--closing-summary-seconds", "0.5"],
+                    env={**env, "FAKE_CLAUDE_HANG_ON_CLOSE": "1"},
+                ),
                 "claude-missing": WorkerType(
                     command=[
                         sys.executable,
@@ -232,4 +240,37 @@ def test_interactive_turns_then_stop_completes(claude_client, boostie):
     )
     s = claude_client.post(f"/v1/sessions/{sid}/stop", headers=boostie).json()
     assert s["status"] == "completed"
-    assert s["summary"] == 'done: <owner-message from="boostie@test">\nsecond\n</owner-message>'
+    # the handoff is a closing summary of the whole session, not the last turn's reply
+    assert s["summary"] == f"done: {claude_code.CLOSING_PROMPT}"
+    assert s["stop_reason"] == "caller_cancelled"  # why it ended isn't lost behind completed
+    evs = events(claude_client, sid, boostie)
+    assert sum("claude started" in (e.get("message") or "") for e in evs) == 1  # not per turn
+
+
+LAST_TURN = 'done: <owner-message from="boostie@test">\nsecond\n</owner-message>'
+
+
+def _two_turns_then_stop(client, headers, worker_type):
+    sid = spawn(client, headers, "first", worker_type=worker_type).json()["session_id"]
+    wait_event(client, sid, headers, lambda e: e["type"] == "needs_input")
+    client.post(f"/v1/sessions/{sid}/messages", json={"message": "second"}, headers=headers)
+    wait_event(client, sid, headers, lambda e: e["type"] == "needs_input" and e.get("turn") == 2)
+    return client.post(f"/v1/sessions/{sid}/stop", headers=headers).json()
+
+
+def test_closing_summary_timeout_keeps_the_last_result(claude_client, boostie):
+    s = _two_turns_then_stop(claude_client, boostie, "claude-chat-slow-close")
+    assert s["status"] == "completed" and s["summary"] == LAST_TURN
+
+
+def test_closing_summary_can_be_turned_off(claude_client, boostie):
+    s = _two_turns_then_stop(claude_client, boostie, "claude-chat-no-summary")
+    assert s["status"] == "completed" and s["summary"] == LAST_TURN
+
+
+def test_init_is_announced_once_per_session_and_model():
+    t = Translator()
+    init = {"type": "system", "subtype": "init", "session_id": "s1", "model": "m1"}
+    assert len(t.handle(init)) == 1
+    assert t.handle(init) == []  # stream-json repeats init every turn
+    assert len(t.handle({**init, "model": "m2"})) == 1  # a model switch is news

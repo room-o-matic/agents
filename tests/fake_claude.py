@@ -9,7 +9,9 @@ blocks, result). Behaviour is chosen by whole words in each user turn:
     slow            don't finish the turn until another user message arrives
     hang            never finish (until killed)
 
-Writes its argv to $FAKE_CLAUDE_ARGV_FILE when set, so tests can check the flags.
+Writes its argv to $FAKE_CLAUDE_ARGV_FILE when set, so tests can check the flags. With
+$FAKE_CLAUDE_HANG_ON_CLOSE set, the closing-summary turn never finishes.
+Like Claude Code, it repeats the system init message at the start of every turn.
 """
 
 import json
@@ -42,20 +44,17 @@ def main() -> int:
         with open(path, "w") as f:
             json.dump(sys.argv[1:], f)
     pending = turns()
-    started = False
     n = 0
     for text in pending:
-        if not started:
-            out(
-                {
-                    "type": "system",
-                    "subtype": "init",
-                    "session_id": SESSION,
-                    "model": "fake-1",
-                    "tools": ["Read"],
-                }
-            )
-            started = True
+        out(
+            {
+                "type": "system",
+                "subtype": "init",
+                "session_id": SESSION,
+                "model": "fake-1",
+                "tools": ["Read"],
+            }
+        )
         n += 1
         out(
             {
@@ -72,7 +71,9 @@ def main() -> int:
         print("not json at all", flush=True)  # the adapter must tolerate stray lines
         if has(text, "die"):
             return 3
-        if has(text, "hang"):
+        if has(text, "hang") or (
+            os.environ.get("FAKE_CLAUDE_HANG_ON_CLOSE") and "ending this session" in text
+        ):
             time.sleep(3600)
         if has(text, "slow"):
             text += " + " + next(pending)

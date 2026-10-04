@@ -631,7 +631,9 @@ class Supervisor:
             watchdog.cancel()
 
         if live.final_seen:
-            status, reason = "completed", None
+            # A worker can finish cleanly because it was asked to stop (an interactive
+            # session). Keep why, so "the owner stopped it" isn't lost behind completed.
+            status, reason = "completed", live.stop_reason
         elif live.stop_status:
             status, reason = live.stop_status, live.stop_reason
         else:
