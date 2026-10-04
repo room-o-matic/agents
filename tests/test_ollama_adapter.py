@@ -139,6 +139,11 @@ def test_oneshot_answer(client, ollama, boostie):
     assert req["model"] == "fake-model" and req["options"]["num_ctx"] == 8192
     assert req["messages"][0]["role"] == "system"
     assert "Never wait or poll" in req["messages"][0]["content"]
+    # it knows what it is (live: qwen2.5 called itself "Ollama Model X")
+    assert (
+        "You are the model fake-model, running locally through Ollama"
+        in (req["messages"][0]["content"])
+    )
     assert "tools" not in req  # read_only_research, no room: nothing to call
 
 

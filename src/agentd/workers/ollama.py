@@ -263,9 +263,13 @@ class Adapter(TurnAdapter):
         self.announced = False
 
     def first_prompt(self, task: str) -> str:
+        # Unlike Claude Code and Codex, a model served by Ollama isn't told what it is; in a
+        # live room qwen2.5 introduced itself as "Ollama Model X (om-x)".
         preamble = system_prompt(self.profile, self.env) + (
-            " You act only through the tools you are given; you have no shell and no "
-            "internet access. When you're done, answer in plain text."
+            f" You are the model {self.args.model}, running locally through Ollama; if anyone "
+            "asks which model you are, say exactly that. You act only through the tools you "
+            "are given; you have no shell and no internet access. When you're done, answer "
+            "in plain text."
         )
         self.messages = [{"role": "system", "content": preamble}]
         return task
