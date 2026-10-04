@@ -236,6 +236,13 @@ def describe_tool(name: str, inp: dict) -> str:
     return name
 
 
+CLOSING_PROMPT = (
+    "Your owner is ending this session now. Write the handoff for the room in 2-4 plain "
+    "sentences: what you did, anything you changed (messages, notes), and what is still "
+    "open. Don't call any tools; just reply with the text."
+)
+
+
 class Translator:
     """Maps Claude stream-json messages to agentd events. Pure, so it's unit-testable."""
 
@@ -243,11 +250,17 @@ class Translator:
         self.claude_session_id: str | None = None
         self.last_result: dict | None = None
         self.turns = 0
+        self._started: tuple | None = None  # (session id, model) last announced
 
     def handle(self, msg: dict) -> list[tuple[str, dict]]:
         kind = msg.get("type")
         if kind == "system" and msg.get("subtype") == "init":
             self.claude_session_id = msg.get("session_id")
+            # stream-json repeats init at every turn; announce it once (or on a change)
+            started = (self.claude_session_id, msg.get("model"))
+            if started == self._started:
+                return []
+            self._started = started
             return [
                 (
                     "progress",
@@ -321,6 +334,8 @@ class Adapter:
         self.watcher: RoomWatcher | None = None
         self.finishing = False  # oneshot: the task's result is in; no more turns
         self.stop_requested = False
+        self.closing = False  # a closing-summary turn is in flight (interactive stop)
+        self.closing_done = asyncio.Event()
 
     async def run(self) -> int:
         emit("progress", message="starting claude")
@@ -435,8 +450,43 @@ class Adapter:
         self.stop_requested = True
         if self.in_turn and self.claude and self.claude.returncode is None:
             self.claude.terminate()  # don't wait for the turn to finish
+        elif self._wants_closing_summary():
+            await self._closing_summary()
         else:
             self._close_claude_stdin()
+
+    def _wants_closing_summary(self) -> bool:
+        """An interactive session stopped between turns has done several things; its
+        handoff should say what, not just repeat the last turn's reply."""
+        return (
+            self.args.interactive
+            and self.args.closing_summary_seconds > 0
+            and self.translator.last_ok
+            and self.translator.turns > 0
+            and self.claude is not None
+            and self.claude.returncode is None
+        )
+
+    async def _closing_summary(self) -> None:
+        """One bounded extra turn for the handoff. If it fails or runs out of time, the
+        previous result stands; the gateway's stop grace must exceed the timeout."""
+        before = self.translator.last_result
+        self.closing = True
+        emit("progress", message="writing a closing summary for the handoff")
+        assert self.claude and self.claude.stdin
+        self.in_turn = True
+        self.claude.stdin.write(user_turn(CLOSING_PROMPT))
+        await self.claude.stdin.drain()
+        try:
+            await asyncio.wait_for(self.closing_done.wait(), self.args.closing_summary_seconds)
+        except TimeoutError:
+            emit("progress", message="closing summary timed out; using the last result")
+            self.translator.last_result = before
+            self.claude.terminate()
+            return
+        if not self.translator.last_ok:
+            self.translator.last_result = before
+        self._close_claude_stdin()
 
     async def _pump_claude(self) -> None:
         assert self.claude and self.claude.stdout
@@ -450,6 +500,9 @@ class Adapter:
                 emit(kind, **fields)
             if msg.get("type") == "result":
                 self.in_turn = False
+                if self.closing:
+                    self.closing_done.set()
+                    continue
                 self._write_result_artifact()
                 if self.args.interactive and self.translator.last_ok:
                     await self._drain_room_queue()
@@ -595,6 +648,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-budget-usd", type=float, help="cap per session; profile may lower it")
     p.add_argument("--interactive", action="store_true", help="wait for messages between turns")
     p.add_argument("--exit-grace-seconds", type=float, default=30)
+    p.add_argument(
+        "--closing-summary-seconds",
+        type=float,
+        default=8,
+        help="interactive: on stop, give claude this long to write the room handoff (0 = off);"
+        " keep it under the gateway's stop_grace_seconds",
+    )
     p.add_argument(
         "--room-wake",
         choices=["mentions", "all", "none"],

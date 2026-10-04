@@ -49,9 +49,14 @@ worker_types:
   claude:
     command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.claude_code,
               --claude, /usr/local/bin/claude, --model, sonnet, --max-budget-usd, "2"]
+  # Pick the model per worker type. In live room tests haiku was fast and cheap but its
+  # reviews were shallow; use sonnet (or better) where judgment matters.
   claude-chat:                     # stays up between turns; stop ends it as completed
     command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.claude_code,
-              --claude, /usr/local/bin/claude, --interactive, --max-budget-usd, "5"]
+              --claude, /usr/local/bin/claude, --interactive, --model, sonnet,
+              --max-budget-usd, "5"]
+    # On stop, claude writes the room handoff in one extra turn (--closing-summary-seconds,
+    # default 8; keep it below stop_grace_seconds, 0 turns it off).
   # When a session is invited into a room, claude also gets room tools (rooms_read,
   # rooms_send, rooms_note_get, rooms_note_put) and room messages that @-mention the worker
   # wake it. --room-wake all|mentions|none and --room-poll-seconds N tune that; "all" makes
