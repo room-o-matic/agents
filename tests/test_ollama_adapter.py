@@ -47,7 +47,7 @@ def test_tools_follow_the_grant(tmp_path):
             "AGENTD_ARTIFACTS_DIR": str(art),
         }
     )
-    assert read.names == {"read_file", "list_files"}
+    assert read.names == {"read_file", "list_files", "search_files"}
     rw = tools_for(
         {
             "AGENTD_WORKSPACE": str(ws),
@@ -55,7 +55,7 @@ def test_tools_follow_the_grant(tmp_path):
             "AGENTD_ARTIFACTS_DIR": str(art),
         }
     )
-    assert rw.names == {"read_file", "list_files", "write_artifact"}
+    assert rw.names == {"read_file", "list_files", "search_files", "write_artifact"}
     call = lambda n, **a: asyncio.run(rw.call(n, a))  # noqa: E731
     assert call("read_file", path="a.txt") == "hello"
     assert '"a.txt"' in call("list_files")
@@ -165,7 +165,11 @@ def test_workspace_tool_loop(client, ollama, boostie, workspace_root):
     assert {t["function"]["name"] for t in ollama.requests[0]["tools"]} == {
         "read_file",
         "list_files",
+        "search_files",
     }
+    first = ollama.requests[0]["messages"]
+    assert "Name only files you actually read" in first[0]["content"]  # grounding rule
+    assert "<workspace-orientation>" in first[1]["content"] and "Project Zed" in first[1]["content"]
 
 
 def test_tool_call_limit_forces_an_answer(client, ollama, boostie, workspace_root):
@@ -394,3 +398,106 @@ def test_room_send_with_string_recipient_reaches_the_room(client, ollama, roomsd
     ).json()["session_id"]
     assert wait_status(client, sid, boostie)["status"] == "completed"
     assert [m["body"] for m in roomsd.messages if m["type"] == "answer"] == ["5-10s with backoff."]
+
+
+def test_search_files_finds_where_a_topic_is_documented(tmp_path):
+    """Live: a 7B model with only list_files answered from file names and invented a script.
+    Search shows it where the answer is."""
+    ws = tmp_path / "ws"
+    (ws / "docs").mkdir(parents=True)
+    (ws / "docs" / "RUNBOOK.md").write_text("intro\n./pki/30-revoke-friend.sh alice  # Revoke\n")
+    (ws / "notes.txt").write_text("nothing here")
+    (ws / ".git").mkdir()
+    (ws / ".git" / "HEAD").write_text("revoke in git metadata")
+    (ws / "blob.bin").write_bytes(b"\0revoke")
+    (tmp_path / "outside.md").write_text("revoke outside")
+    (ws / "link.md").symlink_to(tmp_path / "outside.md")
+    tools = tools_for({"AGENTD_WORKSPACE": str(ws), "AGENTD_WORKSPACE_MODE": "read"})
+    call = lambda n, **a: asyncio.run(tools.call(n, a))  # noqa: E731
+    assert call("search_files", query="REVOKE") == (
+        "docs/RUNBOOK.md:2: ./pki/30-revoke-friend.sh alice  # Revoke"
+    )  # not .git, not binary, not through a symlink out of the workspace
+    assert call("search_files", query="zebra") == "no matches for 'zebra'"
+    hit = "docs/RUNBOOK.md:2: ./pki/30-revoke-friend.sh alice  # Revoke"
+    assert call("search_files", query="revoke friend") == hit  # every word, not the phrase
+    assert call("search_files", query="x", path="..").startswith("error:")
+
+
+def test_orientation_starts_from_the_repos_own_docs(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "docs").mkdir(parents=True)
+    (ws / "README.md").write_text("# VPN\nBotrick is the preferred hub." + "x" * 5000)
+    (ws / "CLAUDE.md").write_text("guide")
+    (ws / ".git").mkdir()
+    o = tools_for({"AGENTD_WORKSPACE": str(ws), "AGENTD_WORKSPACE_MODE": "read"}).orientation()
+    assert "Top level: CLAUDE.md, README.md, docs/" in o and ".git" not in o
+    assert "Botrick is the preferred hub." in o and "(first 4000 of" in o
+    assert "Other guides here: CLAUDE.md, docs/" in o
+    assert tools_for({}).orientation() == ""
+
+
+def kb(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "pki").mkdir(parents=True)
+    (ws / "ops").mkdir()
+    (ws / "pki" / "30-revoke-friend.sh").write_text("#!/bin/sh")
+    (ws / "README.md").write_text("Config: /etc/nomad.d/server.hcl. Revoke with the pki script.")
+    return ws
+
+
+def test_unknown_files_are_what_a_model_invented(tmp_path):
+    """Live: qwen2.5 7B named bin/revoke_user.sh and ops/revoke.sh, which don't exist."""
+    tools = tools_for({"AGENTD_WORKSPACE": str(kb(tmp_path)), "AGENTD_WORKSPACE_MODE": "read"})
+    assert tools.unknown_files("use `ops/revoke.sh` or revoke_user.sh, see README.md") == [
+        "ops/revoke.sh",
+        "revoke_user.sh",
+    ]
+    fine = (
+        "Run ./pki/30-revoke-friend.sh, edit server.hcl (/etc/nomad.d/nomad.hcl), and/or ask;"
+        " see https://example.com/a/b.md, nomad.dev.example.com, 10.0.0.1, ~/.config/x.token"
+    )
+    assert tools.unknown_files(fine) == []  # real, mentioned in the docs, or not repo paths
+    assert tools_for({}).unknown_files("ops/revoke.sh") == []  # no workspace: no check
+
+
+def test_a_post_naming_an_invented_file_is_refused(tmp_path):
+    tools = tools_for({"AGENTD_WORKSPACE": str(kb(tmp_path)), "AGENTD_WORKSPACE_MODE": "read"})
+    tools.names.add("rooms_send")  # no room here: the guard answers before any room call
+    out = asyncio.run(tools.call("rooms_send", {"body": "Run ops/revoke.sh"}))
+    assert out.startswith("error: not posted") and "ops/revoke.sh" in out
+
+
+def test_an_answer_naming_an_invented_file_gets_one_correction(
+    client, ollama, boostie, workspace_root
+):
+    repo = workspace_root / "repo"
+    (repo / "pki").mkdir()
+    (repo / "pki" / "30-revoke-friend.sh").write_text("#!/bin/sh")
+    ollama.script.extend(
+        [
+            {"content": "Use pki/revoke_user.sh."},  # invented, under a real dir
+            tool_call("search_files", query="revoke"),
+            {"content": "Use pki/30-revoke-friend.sh."},
+        ]
+    )
+    sid = spawn(
+        client,
+        boostie,
+        "how do I revoke a friend?",
+        worker_type="ollama",
+        profile="reader",
+        workspace={"path": str(repo)},
+    ).json()["session_id"]
+    s = wait_status(client, sid, boostie)
+    assert s["status"] == "completed" and s["summary"] == "Use pki/30-revoke-friend.sh."
+    nudge = ollama.requests[1]["messages"][-1]
+    assert nudge["role"] == "user" and "pki/revoke_user.sh" in nudge["content"]
+
+
+def test_an_empty_reply_gets_one_more_chance(client, ollama, boostie):
+    """Live: qwen2.5 7B replied with nothing after two tool calls and the session failed."""
+    ollama.script.extend([{"content": ""}, {"content": "Tallahassee."}])
+    sid = spawn(client, boostie, "capital of Florida?", worker_type="ollama").json()["session_id"]
+    s = wait_status(client, sid, boostie)
+    assert s["status"] == "completed" and s["summary"] == "Tallahassee."
+    assert "reply was empty" in ollama.requests[1]["messages"][-1]["content"]
