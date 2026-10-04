@@ -72,6 +72,10 @@ worker_types:
   # tools and runs them itself (room tools; read_file/list_files with a read or read_write
   # workspace; write_artifact with read_write). No shell, no web. Needs a tool-calling
   # model (qwen2.5, llama3.1+). Budgets are tokens: prompt + output as Ollama reports them.
+  # Pick the model for the role: in live room reviews a 7B model (qwen2.5:7b) followed the
+  # protocol well but made a factual slip the cloud models didn't. Use small local models for
+  # cheap, low-stakes roles (summaries, triage, a second opinion), and a larger one
+  # (e.g. qwen2.5:14b/32b, if your GPU allows) or a cloud worker where accuracy matters.
   ollama:
     command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.ollama,
               --model, "qwen2.5:7b-instruct", --interactive,

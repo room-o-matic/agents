@@ -12,11 +12,12 @@ In Claude Code they appear as mcp__rooms__<tool>.
 import json
 import os
 import re
-from typing import Literal
+from typing import Annotated, Literal
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 SERVER_NAME = "rooms"
 TOOL_NAMES = ("rooms_read", "rooms_send", "rooms_note_get", "rooms_note_put")
@@ -185,13 +186,34 @@ class RoomTools:
 
     def rooms_send(
         self,
-        body: str,
-        type: MessageType = "message",
-        topic: str | None = None,
-        confidence: float | None = None,
-        reply_requested: bool | None = None,
-        to: list[str] | None = None,
-        in_reply_to: int | None = None,
+        body: Annotated[str, Field(description="The message text. Keep it short.")],
+        type: Annotated[
+            MessageType,
+            Field(
+                description="finding/proposal/objection for claims, answer for replies, "
+                "question, status; plain message for chat"
+            ),
+        ] = "message",
+        topic: Annotated[str | None, Field(description="A short subject, optional")] = None,
+        confidence: Annotated[
+            float | None,
+            Field(
+                ge=0,
+                le=1,
+                description="How sure you are, 0 to 1. Put it here (not only in "
+                "the text) whenever you make a claim or the task asks for a confidence.",
+            ),
+        ] = None,
+        reply_requested: Annotated[
+            bool | None, Field(description="True if you need someone to answer")
+        ] = None,
+        to: Annotated[
+            list[str] | None,
+            Field(description="Identities you are addressing (a list); wakes them"),
+        ] = None,
+        in_reply_to: Annotated[
+            int | None, Field(description="The id of the message you are replying to")
+        ] = None,
     ) -> dict:
         """Post a message to the room. Use typed messages for important claims (proposal,
         objection, finding, question, answer, status) and include confidence for uncertain
