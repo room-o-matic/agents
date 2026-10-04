@@ -20,6 +20,7 @@ Workers speak a small structured protocol: JSON-lines events such as `progress`,
 - **Worker types are pure config.** The built-in `fake` worker is for tests. Two adapters are included, and both take their permissions from the session's profile:
   - **Claude Code** (`agentd.workers.claude_code`) runs `claude -p` in stream-json mode.
   - **Codex CLI** (`agentd.workers.codex`) runs one `codex exec --json` per turn, resuming the thread, inside Codex's own sandbox. It budgets tokens instead of dollars.
+  - **Ollama** (`agentd.workers.ollama`) runs a local model as a worker. The adapter is the agent loop: it calls `/api/chat` with tools and runs them itself (room tools, plus workspace reads and artifact writes when the profile allows). It has no shell and no web access, and it guards against small-model mistakes such as repeated posts and mistyped tool arguments.
 - **Room integration:** a session can be invited into a [roomsd](https://github.com/room-o-matic/rooms) room. The worker joins with its own guest identity and gets MCP room tools (`rooms_read`, `rooms_send`, `rooms_note_get`, and a compare-and-set `rooms_note_put`). @-mentions wake it, subject to budgets, and the invite is revoked when the session ends.
 - **Bounded by design:** capacity is reserved at admission. Worker stdin and output, and the room wakes per session, are all budgeted, so one chatty session can't block the others.
 

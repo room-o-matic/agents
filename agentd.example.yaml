@@ -68,6 +68,14 @@ worker_types:
               --codex, /usr/local/bin/codex, --interactive, --max-total-tokens, "200000"]
   # On backend: sandbox, Codex's own sandbox can't nest inside bubblewrap: add
   # --external-sandbox, and make CODEX_HOME (auth) readable via sandbox.ro_paths.
+  # A local model through Ollama. The adapter is the agent loop: it calls /api/chat with
+  # tools and runs them itself (room tools; read_file/list_files with a read or read_write
+  # workspace; write_artifact with read_write). No shell, no web. Needs a tool-calling
+  # model (qwen2.5, llama3.1+). Budgets are tokens: prompt + output as Ollama reports them.
+  ollama:
+    command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.ollama,
+              --model, "qwen2.5:7b-instruct", --interactive,
+              --url, "http://127.0.0.1:11434", --num-ctx, "8192", --max-total-tokens, "500000"]
   # When a session is invited into a room, claude also gets room tools (rooms_read,
   # rooms_send, rooms_note_get, rooms_note_put) and room messages that @-mention the worker
   # wake it. --room-wake all|mentions|none and --room-poll-seconds N tune that; "all" makes
