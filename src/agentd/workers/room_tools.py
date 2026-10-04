@@ -16,6 +16,7 @@ from typing import Literal
 
 import httpx
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 SERVER_NAME = "rooms"
 TOOL_NAMES = ("rooms_read", "rooms_send", "rooms_note_get", "rooms_note_put")
@@ -56,10 +57,16 @@ def claude_tool_names(read_only: bool = False) -> list[str]:
     return [f"mcp__{SERVER_NAME}__{name}" for name in names]
 
 
-class RoomsdError(RuntimeError):
+# Failures the model should read and act on are ToolErrors: the MCP SDK passes their
+# message through, but masks any other exception as a bare "Error executing tool".
+class RoomsdError(ToolError, RuntimeError):
     def __init__(self, status: int, detail):
         super().__init__(f"roomsd {status}: {detail}")
         self.status = status
+
+
+class Refused(ToolError, ValueError):
+    """The tools declined to send something (a secret, an oversized body)."""
 
 
 class RoomTools:
@@ -83,6 +90,7 @@ class RoomTools:
         )
         self._cursor: int | None = None
         self._identity: str | None = None
+        self._joined = False  # tried joining already (see _call)
         # Revision of each note as this worker last saw it. rooms_note_put writes only if
         # the note is still there (never seen = create only), so a worker can't silently
         # overwrite a change it never read (docs#20).
@@ -100,10 +108,16 @@ class RoomTools:
     def _check_outbound(self, *texts: str) -> None:
         for text in texts:
             if any(secret in text for secret in self._secrets):
-                raise ValueError("refusing to post: the text contains a credential or secret value")
+                raise Refused("refusing to post: the text contains a credential or secret value")
 
     def _call(self, method: str, path: str, **kw):
         r = self._http.request(method, path, **kw)
+        if r.status_code == 403 and not self._joined and "join the room first" in r.text:
+            # Standalone use (an owner's own session holding an invite) hasn't joined yet;
+            # inside agentd the adapter joined before starting us. Join once and retry.
+            self._joined = True
+            self._call("POST", f"/v1/rooms/{self.room_id}/participants", json={})
+            r = self._http.request(method, path, **kw)
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)
@@ -183,7 +197,7 @@ class RoomTools:
         objection, finding, question, answer, status) and include confidence for uncertain
         ones. Publish long content as a file artifact rather than a huge message."""
         if len(body.encode()) > BODY_LIMIT:
-            raise ValueError(f"message is over {BODY_LIMIT} bytes; summarise it")
+            raise Refused(f"message is over {BODY_LIMIT} bytes; summarise it")
         self._check_outbound(body, topic or "")
         payload = {
             "body": body,

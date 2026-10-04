@@ -270,3 +270,47 @@ def test_mention_in_room_wakes_worker(room_client, roomsd, boostie):
         time.sleep(0.05)
     assert roomsd.messages[-1]["type"] == "handoff"
     assert "inv_worker" in roomsd.revoked
+
+
+# ----- standalone use: an owner's own Claude Code session (live test 2) ------------------
+
+
+def test_tools_join_the_room_on_first_use(roomsd):
+    """Inside agentd the adapter joins before starting the tools; a standalone session
+    holding only an invite must join by itself instead of failing every call with 403."""
+    roomsd.require_join = True
+    roomsd.post("boostie@test", "hello")
+    tools = RoomTools(roomsd.url, "room_1", "inv_worker")
+    assert [m["body"] for m in tools.rooms_read()["messages"]] == ["hello"]
+    assert WORKER in roomsd.participants
+    tools.rooms_send("hi back")  # already joined: no second join needed
+    assert roomsd.messages[-1]["from"] == WORKER
+
+
+def test_errors_reach_the_model_through_mcp(roomsd):
+    """The MCP SDK masks any non-ToolError as 'Error executing tool'; the model must see
+    why a call failed (revoked invite, secret refused, too long) to act on it."""
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+
+    tools = RoomTools(roomsd.url, "room_1", "inv_worker", secrets=["sk-ant-xyz-123456"])
+    server = room_tools.build_server(tools)
+
+    def failure(name, args):
+        with pytest.raises(ToolError) as e:
+            asyncio.run(server.call_tool(name, args))
+        assert not isinstance(e.value, UnexpectedToolError)
+        return str(e.value)
+
+    assert "refusing to post" in failure("rooms_send", {"body": "key sk-ant-xyz-123456"})
+    assert "summarise" in failure("rooms_send", {"body": "x" * (room_tools.BODY_LIMIT + 1)})
+    roomsd.revoked.add("inv_worker")
+    assert "roomsd 401" in failure("rooms_read", {})
+
+
+def test_rooms_mcp_entry_point():
+    from importlib.metadata import entry_points
+
+    (ep,) = [e for e in entry_points(group="console_scripts") if e.name == "rooms-mcp"]
+    assert ep.value == "agentd.workers.room_tools:main"

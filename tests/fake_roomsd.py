@@ -18,6 +18,7 @@ class FakeRoomsd:
         self.messages: list[dict] = []
         self.notes: dict[str, dict] = {}
         self.participants: set[str] = set()
+        self.require_join = False  # like roomsd: room routes 403 until the caller joins
         self.revoked: set[str] = set()
         self.revoke_status = 204  # docs#17 fault injection
         self.post_status: int | None = None
@@ -84,6 +85,8 @@ class FakeRoomsd:
                 if p == f"{room}/participants" and method == "POST":
                     fake.participants.add(who)
                     return self._reply(200, {"agent": who})
+                if fake.require_join and p.startswith(room) and who not in fake.participants:
+                    return self._reply(403, {"detail": "join the room first"})
                 if p == f"{room}/messages" and method == "POST":
                     if fake.post_status is not None:
                         return self._reply(fake.post_status, {"detail": "injected"})
