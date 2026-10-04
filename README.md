@@ -17,7 +17,9 @@ Workers speak a small structured protocol: JSON-lines events such as `progress`,
 
 - **Profiles are server-side allowlists:** network, filesystem, workspace mount, runtime and budget. Callers pick a profile by name and never pass raw permissions.
 - **Default-deny caller grants:** every caller needs an operator policy entry, and untrusted callers run only on the sandbox backend.
-- **Worker types are pure config.** The built-in `fake` worker is for tests. There is a **Claude Code adapter** (`agentd.workers.claude_code`) that runs `claude -p` in stream-json mode, with tool permissions derived from the profile.
+- **Worker types are pure config.** The built-in `fake` worker is for tests. Two adapters are included, and both take their permissions from the session's profile:
+  - **Claude Code** (`agentd.workers.claude_code`) runs `claude -p` in stream-json mode.
+  - **Codex CLI** (`agentd.workers.codex`) runs one `codex exec --json` per turn, resuming the thread, inside Codex's own sandbox. It budgets tokens instead of dollars.
 - **Room integration:** a session can be invited into a [roomsd](https://github.com/room-o-matic/rooms) room. The worker joins with its own guest identity and gets MCP room tools (`rooms_read`, `rooms_send`, `rooms_note_get`, and a compare-and-set `rooms_note_put`). @-mentions wake it, subject to budgets, and the invite is revoked when the session ends.
 - **Bounded by design:** capacity is reserved at admission. Worker stdin and output, and the room wakes per session, are all budgeted, so one chatty session can't block the others.
 
