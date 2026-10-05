@@ -17,10 +17,10 @@ Workers speak a small structured protocol: JSON-lines events such as `progress`,
 
 - **Profiles are server-side allowlists:** network, filesystem, workspace mount, runtime and budget. Callers pick a profile by name and never pass raw permissions.
 - **Default-deny caller grants:** every caller needs an operator policy entry, and untrusted callers run only on the sandbox backend.
-- **Worker types are pure config.** The built-in `fake` worker is for tests. Two adapters are included, and both take their permissions from the session's profile:
+- **Worker types are pure config.** The built-in `fake` worker is for tests. Three adapters are included, and all take their permissions from the session's profile:
   - **Claude Code** (`agentd.workers.claude_code`) runs `claude -p` in stream-json mode.
   - **Codex CLI** (`agentd.workers.codex`) runs one `codex exec --json` per turn, resuming the thread, inside Codex's own sandbox. It budgets tokens instead of dollars.
-  - **Ollama** (`agentd.workers.ollama`) runs a local model as a worker. The adapter is the agent loop: it calls `/api/chat` with tools and runs them itself (room tools, plus workspace reads and artifact writes when the profile allows). It has no shell and no web access, and it guards against small-model mistakes such as repeated posts and mistyped tool arguments.
+  - **Ollama** (`agentd.workers.ollama`) runs a local model as a worker. The adapter is the agent loop: it calls `/api/chat` with tools and runs them itself (room tools, plus workspace reads, search and artifact writes when the profile allows). It has no shell and no web access, and it guards against small-model mistakes: repeated posts, mistyped tool arguments, empty replies, and file names it invented instead of reading.
 - **Room integration:** a session can be invited into a [roomsd](https://github.com/room-o-matic/rooms) room. The worker joins with its own guest identity and gets MCP room tools (`rooms_read`, `rooms_send`, `rooms_note_get`, and a compare-and-set `rooms_note_put`). @-mentions wake it, subject to budgets, and the invite is revoked when the session ends.
 - **Bounded by design:** capacity is reserved at admission. Worker stdin and output, and the room wakes per session, are all budgeted, so one chatty session can't block the others.
 
@@ -75,13 +75,16 @@ rom summon "$ROOM" "how is a new client added?" --worker-type claude \
 (dispatch templates take `workspace:` on a worker; `rom mcp`'s `worker_summon` takes `workspace`.)
 
 - **Mount a clean clone, not your working checkout.** A worker can read every file in its workspace, including gitignored secrets such as tokens, keys and `.env` files. A `git clone` holds committed files only. It doesn't include uncommitted edits either.
-- **What "read" means per adapter:** Claude gets read tools only (no write tools, no shell unless the profile has `shell: true`); Codex runs in its `read-only` sandbox; Ollama gets `read_file`/`list_files` confined to the workspace.
+- **What "read" means per adapter:** Claude gets read tools only (no write tools, no shell unless the profile has `shell: true`); Codex runs in its `read-only` sandbox; Ollama gets `read_file`, `list_files` and `search_files` confined to the workspace, and starts from the repo's README.
+- **Which worker:** in live tests Claude (Sonnet) answered repo questions correctly with cited files for about $0.07 each. A 7B Ollama model found the right files but got details wrong; use it for rough lookups only.
 - **On the process backend that's not isolation:** agentd only sets the working directory; it doesn't stop a worker's own tools from reaching other files the agentd user can read. Use `backend: sandbox` so only the workspace and the runtime are visible.
 - A path outside `workspace_roots` or the caller's grant is refused with 403. Workspace paths are per host: give each agentd its own clones.
 
 ## Attach your own Claude Code session to a room
 
-The same room tools that agentd gives its workers also run as a standalone MCP server, `rooms-mcp`. That lets your own interactive Claude Code session take part in a room through an invite.
+**Usually you want `rom mcp` instead:** it acts as *you* in every room you can read, with no invite or expiry, and a prompt hook brings your @-mentions in. See the [client README](https://github.com/room-o-matic/client#use-it-from-claude-code). The guest route below is for giving a session access to one room only.
+
+The same room tools that agentd gives its workers also run as a standalone MCP server, `rooms-mcp`. That lets an interactive Claude Code session take part in a room through an invite.
 
 ```bash
 # 1. Mint an invite for your session (any member with the invite right can do this).
