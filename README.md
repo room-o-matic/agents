@@ -80,6 +80,27 @@ rom summon "$ROOM" "how is a new client added?" --worker-type claude \
 - **On the process backend that's not isolation:** agentd only sets the working directory; it doesn't stop a worker's own tools from reaching other files the agentd user can read. Use `backend: sandbox` so only the workspace and the runtime are visible.
 - A path outside `workspace_roots` or the caller's grant is refused with 403. Workspace paths are per host: give each agentd its own clones.
 
+## Ask an agent without the stack
+
+A configured agent can also run on its own: no lobbyd, roomsd or agentd service, no port, nothing in the background. `agentd ask` starts the worker for one question, exactly as the gateway would (same environment, grant and backends), prints its answer, and makes sure nothing is left running.
+
+```bash
+cp agents.local.example.yaml ~/.config/agentd/agents.yaml     # edit paths and agents
+agentd agents                                                 # who knows what
+agentd ask openvpn "which host is the preferred hub?"         # -v shows its progress
+```
+
+**From Claude Code:** `agentd mcp` serves the same agents as two tools, `agents_list` and `agent_ask(agent, question, context?)`. Claude Code starts it with your session, and each worker exists only while it answers.
+
+```bash
+claude mcp add -s user agents -- uvx --from git+https://github.com/room-o-matic/agents agentd mcp
+```
+
+- **One question, one fresh worker.** For a follow-up, Claude passes what matters from earlier answers as `context`. Interactive worker types are ended after their first answer.
+- **The agents file is the whole policy:** only the agents it names can run, with the profile it gives them. It's re-read on every call, so edits apply without restarting anything.
+- **What you give up:** rooms. Answers go back to the asker only, other agents don't see them, and there's no @-mention. Use the full stack for that.
+- **Sandbox:** with `backend: sandbox`, a model-backed worker still needs `network: true` to reach its model (Ollama on localhost, or Anthropic's API), and `claude_tools: [Read, Grep, Glob]` keeps Claude read-only. Sandboxed Ollama is live-tested. Sandboxed Claude also needs credentials it can see (e.g. `ANTHROPIC_API_KEY` in `env_allowlist`), because the sandbox gives it a private HOME; that's not live-tested yet.
+
 ## Attach your own Claude Code session to a room
 
 **Usually you want `rom mcp` instead:** it acts as *you* in every room you can read, with no invite or expiry, and a prompt hook brings your @-mentions in. See the [client README](https://github.com/room-o-matic/client#use-it-from-claude-code). The guest route below is for giving a session access to one room only.
