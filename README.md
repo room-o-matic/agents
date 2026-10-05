@@ -11,6 +11,8 @@ agentd is an always-on gateway that starts helper workers only when they're aske
 
 Workers speak a small structured protocol: JSON-lines events such as `progress`, `artifact`, `needs_input` and `final`. Raw terminal output is never the source of truth.
 
+The same workers also run **without the gateway**: `agentd ask` and `agentd mcp` start a configured agent for one question, with no service running at all (see [Ask an agent without the stack](#ask-an-agent-without-the-stack)).
+
 > Status: MVP. Backends are `process` (no isolation, trusted callers only) and `sandbox` (bubblewrap). A Docker backend is planned.
 
 ## What's in the box
@@ -22,6 +24,7 @@ Workers speak a small structured protocol: JSON-lines events such as `progress`,
   - **Codex CLI** (`agentd.workers.codex`) runs one `codex exec --json` per turn, resuming the thread, inside Codex's own sandbox. It budgets tokens instead of dollars.
   - **Ollama** (`agentd.workers.ollama`) runs a local model as a worker. The adapter is the agent loop: it calls `/api/chat` with tools and runs them itself (room tools, plus workspace reads, search and artifact writes when the profile allows). It has no shell and no web access, and it guards against small-model mistakes: repeated posts, mistyped tool arguments, empty replies, and file names it invented instead of reading.
 - **Room integration:** a session can be invited into a [roomsd](https://github.com/room-o-matic/rooms) room. The worker joins with its own guest identity and gets MCP room tools (`rooms_read`, `rooms_send`, `rooms_note_get`, and a compare-and-set `rooms_note_put`). @-mentions wake it, subject to budgets, and the invite is revoked when the session ends.
+- **Standalone asks:** `agentd ask <agent> <question>` and the `agentd mcp` server (for Claude Code) run an agent from a local agents file, with nothing in the background. Each worker exists only while it answers.
 - **Bounded by design:** capacity is reserved at admission. Worker stdin and output, and the room wakes per session, are all budgeted, so one chatty session can't block the others.
 
 ## Run
@@ -56,7 +59,7 @@ The protocol version is `room-o-matic.agentd/1`. The [roomomatic client](https:/
 
 ## Repos as knowledge bases
 
-A worker runs with its workspace as its working directory. With a read-only profile, an existing repo becomes knowledge it can answer from:
+A worker runs with its workspace as its working directory. With a read-only profile, an existing repo becomes knowledge it can answer from. This works through the gateway (below, answers posted in a room) or with no services at all through [`agentd ask`](#ask-an-agent-without-the-stack).
 
 ```yaml
 workspace_roots: [/srv/kb]
