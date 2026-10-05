@@ -173,3 +173,22 @@ def test_mcp_tools(tmp_path):
     path.write_text("agents: {}")  # edits apply on the next call, and stay readable
     with pytest.raises(ToolError, match="agents file is invalid"):
         asyncio.run(server.call_tool("agents_list", {}))
+
+
+def test_a_clipped_answer_is_returned_in_full(tmp_path):
+    """Live: a detailed answer came back cut at the adapter's 4000-character summary limit,
+    though the full text was in result.md."""
+    art = tmp_path / "art"
+    art.mkdir()
+    full = "step " * 2000
+    (art / "result.md").write_text(full)
+    assert local.full_answer(full[:4000] + local.CLIPPED, art) == full
+    assert local.full_answer("short answer", art) == "short answer"  # not clipped: kept
+    assert local.full_answer("x" + local.CLIPPED, tmp_path / "none") == "x" + local.CLIPPED
+
+
+def test_claude_long_answer_end_to_end(cfg):
+    """fake_claude echoes the prompt: past the summary limit the ask still gets all of it."""
+    question = "explain " + "detail " * 900  # > 4000 characters of answer
+    r = run(cfg, "vpn", question)
+    assert not r["answer"].endswith(local.CLIPPED) and len(r["answer"]) > 4000

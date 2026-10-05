@@ -45,6 +45,8 @@ from agentd.supervisor import worker_environment
 DEFAULT_PATH = Path("~/.config/agentd/agents.yaml")
 MAX_LINE_BYTES = 1024 * 1024
 STDERR_TAIL = 2000
+CLIPPED = " …[truncated]"  # how adapters mark a summary cut to fit a room message
+FULL_ANSWER_LIMIT = 256 * 1024
 
 
 class LocalAgent(BaseModel):
@@ -185,6 +187,7 @@ async def ask(
             raise AskError(f"agent {name!r} failed to start: {e}") from None
         text = task_text(question, context)
         result = await _drive(cfg, handle, session_id, text, timeout, on_event)
+        result["answer"] = full_answer(result["answer"], artifacts)
     if result["answer"] is None:
         why = result["error"] or "it exited without an answer"
         if result["stderr"]:
@@ -196,6 +199,19 @@ async def ask(
         "cost_usd": result["cost_usd"],
         "session_id": session_id,
     }
+
+
+def full_answer(answer: str | None, artifacts: Path) -> str | None:
+    """Adapters clip `final.summary` to fit a room message (Claude: 4000 characters), but
+    the Claude adapter also saves the whole result as result.md. Live, a detailed answer
+    was cut mid-step; an ask has no room message to fit, so it returns the full text."""
+    if not answer or not answer.endswith(CLIPPED):
+        return answer
+    try:
+        full = (artifacts / "result.md").read_bytes()[:FULL_ANSWER_LIMIT].decode(errors="replace")
+    except OSError:
+        return answer
+    return full if full.strip() else answer
 
 
 async def _drive(
