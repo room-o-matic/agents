@@ -75,6 +75,49 @@ def task_grant(
     }
 
 
+def worker_environment(
+    env_allowlist: list[str],
+    instance_id: str,
+    session_id: str,
+    profile_name: str,
+    profile: Profile,
+    worker_env: dict[str, str],
+    artifacts_dir: Path,
+    workspace: Path | None,
+    room: RoomRef | None,
+    requester: str,
+    expires_at: str,
+    caller: CallerPolicy | None,
+) -> dict[str, str]:
+    """Everything a worker learns about its session comes from this environment: the host
+    env vars on the allowlist, the worker type's own env, and the AGENTD_* grant. Shared by
+    the gateway and the local runner (agentd.local), so a worker can't tell them apart."""
+    env = {k: os.environ[k] for k in env_allowlist if k in os.environ}
+    env.update(worker_env)
+    env.update(
+        AGENTD_SESSION_ID=session_id,
+        AGENTD_INSTANCE_ID=instance_id,
+        AGENTD_PROFILE_NAME=profile_name,
+        AGENTD_PROFILE=profile.model_dump_json(),
+        AGENTD_ARTIFACTS_DIR=str(artifacts_dir),
+        AGENTD_GRANT=json.dumps(
+            task_grant(
+                session_id, profile_name, profile, workspace, room, requester, expires_at, caller
+            )
+        ),
+    )
+    if workspace:
+        env.update(AGENTD_WORKSPACE=str(workspace), AGENTD_WORKSPACE_MODE=profile.workspace_mount)
+    if room:
+        env.update(
+            ROOMSD_URL=room.base_url,
+            ROOMSD_ROOM_ID=room.room_id,
+            ROOMSD_ROOM_URL=room.room_url,
+            ROOMSD_TOKEN=room.token,
+        )
+    return env
+
+
 class SpawnReplay(Exception):  # noqa: N818 - control flow, not an error
     """The spawn is a retry of an earlier operation; carries the original session row."""
 
@@ -198,39 +241,20 @@ class Supervisor:
         expires_at: str,
         caller: CallerPolicy,
     ) -> dict[str, str]:
-        env = {k: os.environ[k] for k in self.settings.env_allowlist if k in os.environ}
-        env.update(worker_env)
-        env.update(
-            AGENTD_SESSION_ID=session_id,
-            AGENTD_INSTANCE_ID=self.settings.instance_id,
-            AGENTD_PROFILE_NAME=profile_name,
-            AGENTD_PROFILE=profile.model_dump_json(),
-            AGENTD_ARTIFACTS_DIR=str(artifacts_dir),
-            AGENTD_GRANT=json.dumps(
-                task_grant(
-                    session_id,
-                    profile_name,
-                    profile,
-                    workspace,
-                    room,
-                    requester,
-                    expires_at,
-                    caller,
-                )
-            ),
+        return worker_environment(
+            self.settings.env_allowlist,
+            self.settings.instance_id,
+            session_id,
+            profile_name,
+            profile,
+            worker_env,
+            artifacts_dir,
+            workspace,
+            room,
+            requester,
+            expires_at,
+            caller,
         )
-        if workspace:
-            env.update(
-                AGENTD_WORKSPACE=str(workspace), AGENTD_WORKSPACE_MODE=profile.workspace_mount
-            )
-        if room:
-            env.update(
-                ROOMSD_URL=room.base_url,
-                ROOMSD_ROOM_ID=room.room_id,
-                ROOMSD_ROOM_URL=room.room_url,
-                ROOMSD_TOKEN=room.token,
-            )
-        return env
 
     def by_operation(self, requester_agent: str, operation_id: str) -> sqlite3.Row | None:
         return self.conn.execute(

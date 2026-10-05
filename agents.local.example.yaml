@@ -1,0 +1,34 @@
+# Local agents for `agentd ask` and `agentd mcp`: no lobbyd, roomsd or agentd service needed.
+# Copy to ~/.config/agentd/agents.yaml (or point $AGENTD_AGENTS at it). The file is the whole
+# policy: only the agents named here can run, each with the profile it's given here.
+
+backend: process          # process (no isolation) | sandbox (bubblewrap; recommended)
+env_allowlist: [PATH, HOME, LANG, LC_ALL, TZ]   # add ANTHROPIC_API_KEY for claude in the sandbox
+
+worker_types:
+  claude:
+    command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.claude_code,
+              --claude, /usr/local/bin/claude, --model, sonnet, --max-budget-usd, "0.25"]
+  ollama:
+    command: [/opt/agentd/.venv/bin/python, -m, agentd.workers.ollama,
+              --model, "qwen2.5:7b-instruct-q4_K_M", --temperature, "0.2"]
+
+profiles:
+  # A model-backed worker must reach its model (the Anthropic API, or Ollama on localhost),
+  # so network stays on. With network on, claude_tools keeps Claude to read-only tools
+  # (no WebFetch/WebSearch).
+  knowledge_read:
+    max_runtime_minutes: 10
+    workspace_mount: read
+    network: true
+    claude_tools: [Read, Grep, Glob]
+
+agents:
+  # Workspaces are clean clones (git clone), never working checkouts: the agent can read
+  # every file there, gitignored secrets included.
+  openvpn: {worker_type: claude, profile: knowledge_read, workspace: ~/kb/openvpn,
+            description: "The two-hub OpenVPN network: hubs, routes, clients"}
+  nomad:   {worker_type: claude, profile: knowledge_read, workspace: ~/kb/nomad_consul,
+            description: "The Nomad + Consul cluster: PKI, ACL tokens, friends, operations"}
+  quick:   {worker_type: ollama, profile: knowledge_read, workspace: ~/kb/openvpn,
+            description: "Free, local, rough lookups in the OpenVPN repo"}

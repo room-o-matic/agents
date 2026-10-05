@@ -18,6 +18,57 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    import asyncio
+
+    from agentd import local
+
+    def show(event: dict) -> None:
+        if args.verbose and event["type"] in ("progress", "error"):
+            print(f"  … {event.get('message', '')[:200]}", file=sys.stderr, flush=True)
+
+    try:
+        cfg = local.load(args.agents)
+        r = asyncio.run(
+            local.ask(
+                cfg,
+                args.agent,
+                " ".join(args.question),
+                context=args.context,
+                timeout=args.timeout,
+                on_event=show,
+            )
+        )
+    except (local.AskError, ValueError) as e:
+        print(f"agentd: {e}", file=sys.stderr)
+        return 1
+    print(r["answer"])
+    if r["cost_usd"] is not None:
+        print(f"(cost ${r['cost_usd']:.4f})", file=sys.stderr)
+    return 0
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    from agentd import local
+
+    try:
+        cfg = local.load(args.agents)
+    except (local.AskError, ValueError) as e:
+        print(f"agentd: {e}", file=sys.stderr)
+        return 1
+    for a in local.describe(cfg):
+        where = f" [{a['workspace']}]" if a["workspace"] else ""
+        print(f"{a['agent']}: {a['worker_type']}/{a['profile']}{where}  {a['description']}")
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    from agentd import local
+
+    local.build_server(args.agents).run("stdio")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Print the effective config (secrets hidden), to check a YAML file and env."""
     settings = Settings.load(args.config)
@@ -72,6 +123,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="YAML config file (default: $AGENTD_CONFIG)")
     sub = p.add_subparsers(dest="command", required=True)
 
+    a = sub.add_parser("ask", help="ask a local agent a question (no services needed)")
+    a.add_argument("agent")
+    a.add_argument("question", nargs="+")
+    a.add_argument("--context", help="earlier answers or facts to pass along")
+    a.add_argument("--timeout", type=float, help="seconds (at most the profile's runtime)")
+    a.add_argument(
+        "--agents",
+        type=Path,
+        help="agents file (default $AGENTD_AGENTS or ~/.config/agentd/agents.yaml)",
+    )
+    a.add_argument("-v", "--verbose", action="store_true", help="show the agent's progress")
+    a.set_defaults(func=cmd_ask)
+    ag = sub.add_parser("agents", help="list the local agents")
+    ag.add_argument("--agents", type=Path)
+    ag.set_defaults(func=cmd_agents)
+    m = sub.add_parser("mcp", help="serve the local agents as MCP tools (stdio)")
+    m.add_argument("--agents", type=Path)
+    m.set_defaults(func=cmd_mcp)
     serve = sub.add_parser("serve", help="run the gateway")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
